@@ -1,0 +1,28 @@
+# Build directories
+build/
+bin/
+out/
+cmake-build-*/
+
+# Visual Studio & VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Compiled binaries and libraries
+*.exe
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Generated data/logs
+data/*.txt
+data/*.bin
+!data/generator/
+*.log
+*.csv
