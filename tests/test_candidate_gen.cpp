@@ -266,6 +266,81 @@ void test_essential_correctness_guarantee() {
           "Pipeline verified pairs must exactly match exhaustive all-pairs verification at threshold 3!");
 }
 
+void test_non_contiguous_and_reordered_ids() {
+    // 3 documents with arbitrary non-contiguous IDs: 5000, 10, 999999
+    // docA and docB are exact copies (should match)
+    // docC is different
+    Document docA{5000, 1, DocumentKind::Original, -1, "concurrency thread scheduling load balance"};
+    Document docB{10, 1, DocumentKind::ExactCopy, 5000, "concurrency thread scheduling load balance"};
+    Document docC{999999, 2, DocumentKind::Unrelated, -1, "network database transaction isolation level"};
+
+    // Run in original order: [5000, 10, 999999]
+    PipelineResult res1 = run_sequential_pipeline({docA, docB, docC});
+    check(res1.candidate_pairs.size() == 1, "test_non_contig_cand_count", "Expected 1 candidate pair.");
+    check(res1.candidate_pairs[0].first == 10 && res1.candidate_pairs[0].second == 5000,
+          "test_non_contig_norm", "Pair must be normalized using true doc IDs (10 < 5000).");
+    check(res1.verified_pairs.size() == 1, "test_non_contig_ver_count", "Expected 1 verified pair.");
+    check(res1.verified_pairs[0].first == 10 && res1.verified_pairs[0].second == 5000 &&
+          res1.verified_pairs[0].distance == 0, "test_non_contig_ver_pair", "Verified pair must match IDs and dist 0.");
+
+    // Run in reordered order: [999999, 5000, 10]
+    PipelineResult res2 = run_sequential_pipeline({docC, docA, docB});
+    check(res1.candidate_pairs == res2.candidate_pairs, "test_reordered_candidates_equal",
+          "Reordered inputs must produce bitwise-identical candidate pairs.");
+    check(res1.verified_pairs == res2.verified_pairs, "test_reordered_verified_equal",
+          "Reordered inputs must produce bitwise-identical verified pairs.");
+}
+
+void test_duplicate_document_ids_rejected() {
+    Document doc1{100, 1, DocumentKind::Original, -1, "parallel loop"};
+    Document doc2{100, 1, DocumentKind::ExactCopy, 100, "parallel loop"}; // Duplicate ID: 100
+
+    bool caught = false;
+    try {
+        run_sequential_pipeline({doc1, doc2});
+    } catch (const std::invalid_argument&) {
+        caught = true;
+    }
+    check(caught, "test_duplicate_ids_rejected", "Duplicate document IDs must throw std::invalid_argument.");
+}
+
+void test_fingerprint_level_pigeonhole_guarantee() {
+    // Generate synthetic 64-bit fingerprints with controlled bit differences (distances 0 to 8)
+    // To guarantee direct bitwise verification independent of text generation
+    uint64_t base_fp = 0x0123456789ABCDEFULL;
+    std::vector<Document> docs;
+
+    // Doc 0: base
+    docs.push_back(Document{10, 1, DocumentKind::Original, -1, "base document"});
+
+    // Construct 8 variant documents with distance d in [1, 8] from base_fp
+    // By directly setting text, compute_simhash would hash words.
+    // Here we verify using the candidate pipeline on documents whose SimHash
+    // has known bit differences.
+    // Notice: We test extract_band directly for distances 0..7:
+    for (int diff_bits = 0; diff_bits <= 7; ++diff_bits) {
+        // Place diff_bits in at most 7 different bands (one per band max)
+        // Since there are 8 bands, by Pigeonhole, at least (8 - diff_bits) >= 1 band has 0 diffs.
+        uint64_t diff_mask = 0ULL;
+        for (int b = 0; b < diff_bits; ++b) {
+            diff_mask |= (1ULL << (b * 8)); // 1 bit flip in band b
+        }
+        uint64_t variant_fp = base_fp ^ diff_mask;
+        check(hamming_distance(base_fp, variant_fp) == diff_bits,
+              "test_pigeonhole_bit_dist", "Calculated distance must match diff_bits.");
+
+        // Assert at least one band has identical 8-bit value
+        bool found_shared_band = false;
+        for (size_t band = 0; band < kNumBands; ++band) {
+            if (extract_band(base_fp, band) == extract_band(variant_fp, band)) {
+                found_shared_band = true;
+                break;
+            }
+        }
+        check(found_shared_band, "test_pigeonhole_shared_band", "Distance <= 7 must share at least 1 band!");
+    }
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << " Running Phase 3 Test Suite: Sequential Pipeline\n";
@@ -274,10 +349,13 @@ int main() {
     test_empty_and_single_document();
     test_band_extraction_boundaries();
     test_pair_normalization_and_deduplication();
+    test_non_contiguous_and_reordered_ids();
+    test_duplicate_document_ids_rejected();
     test_hamming_threshold_boundary();
     test_deterministic_ordering();
     test_workload_statistics_and_cv();
     test_empty_and_whitespace_documents();
+    test_fingerprint_level_pigeonhole_guarantee();
     test_essential_correctness_guarantee();
 
     std::cout << "\n=========================================================\n";

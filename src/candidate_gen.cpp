@@ -71,9 +71,15 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
 
     for (size_t i = 0; i < num_docs; ++i) {
         const auto& doc = documents[i];
+        auto insert_res = id_to_index.emplace(doc.id, i);
+        if (!insert_res.second) {
+            throw std::invalid_argument(
+                "run_sequential_pipeline: Duplicate document ID detected (" +
+                std::to_string(doc.id) + "). All document IDs must be unique."
+            );
+        }
         result.document_ids.push_back(doc.id);
         result.fingerprints.push_back(compute_simhash(doc.text, config.shingle_size));
-        id_to_index[doc.id] = i;
     }
 
     auto t1_end = Clock::now();
