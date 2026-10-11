@@ -151,7 +151,10 @@ struct AdaptiveDiagnostics {
 /**
  * @brief Non-overlapping wall-clock stage timings (in milliseconds) for the adaptive pipeline.
  *
- * Timing Definitions:
+ * All stage and total timings are measured with `SteadyClock` (`std::chrono::steady_clock`)
+ * and converted to milliseconds via `elapsed_ms(start, end)`.
+ *
+ * Timing Definitions (strictly non-overlapping sequential/parallel phases):
  * - fingerprinting_ms: Parallel SimHash computation across all input documents.
  * - bucket_construction_stats_ms: Sequential band table insertion and WorkloadStatistics computation.
  * - adaptive_decision_ms: Evaluating CV against cv_threshold and classifying positive-work buckets
@@ -164,6 +167,16 @@ struct AdaptiveDiagnostics {
  *   sorting, and std::unique deduplication.
  * - verification_ms: Parallel Hamming-distance verification, sequential merge, and deterministic sort.
  * - total_pipeline_ms: Complete end-to-end wall-clock runtime of run_adaptive_pipeline().
+ *
+ * Relationship to `PipelineResult::timings` (`StageTimings`):
+ * - `candidate_generation_dedup_ms` is the exact sum of Sub-stages 3a through 3e:
+ *   `adaptive_decision_ms + ordinary_candidate_gen_ms + heavy_chunk_generation_ms +
+ *    heavy_pair_processing_ms + merge_sort_dedup_ms`.
+ * - Intentional difference between `total_pipeline_ms` and the sum of stages (1 + 2 + 3 + 4):
+ *   `total_pipeline_ms` spans from function entry to return and therefore additionally includes
+ *   initial vector allocation (`document_ids`, `fingerprints`), sequential pre-stage `id_to_index`
+ *   hash-map construction and duplicate-ID validation before Stage 1, and outer per-thread slot
+ *   vector allocation before Stage 3b.
  */
 struct AdaptiveStageTimings {
     double fingerprinting_ms{0.0};

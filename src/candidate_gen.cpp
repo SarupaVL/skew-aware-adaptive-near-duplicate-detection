@@ -44,31 +44,30 @@ void StageTimings::print(std::ostream& os) const {
 
 PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
                                        const PipelineConfig& config) {
-    using Clock = std::chrono::high_resolution_clock;
-    auto pipeline_start = Clock::now();
+    auto pipeline_start = SteadyClock::now();
 
     PipelineResult result;
     size_t num_docs = documents.size();
-    result.document_ids.reserve(num_docs);
-    result.fingerprints.reserve(num_docs);
+    result.document_ids.resize(num_docs);
+    result.fingerprints.resize(num_docs);
 
     if (documents.empty()) {
         result.actual_thread_count = 1;
         result.per_thread_pair_work = {0ULL};
         result.per_thread_units_processed = {0};
-        auto pipeline_end = Clock::now();
-        result.timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
-            pipeline_end - pipeline_start
-        ).count();
+        auto pipeline_end = SteadyClock::now();
+        result.timings.total_pipeline_ms = elapsed_ms(pipeline_start, pipeline_end);
         return result;
     }
 
     // -------------------------------------------------------------
-    // Stage 1: Document Fingerprinting
+    // Pre-Stage Validation & ID Mapping
     // -------------------------------------------------------------
-    auto t1_start = Clock::now();
-
-    // Map each document ID to its position in result arrays for fast fingerprint lookup
+    // Map each document ID to its position in result arrays for fast fingerprint lookup.
+    // Note: This sequential validation step runs before t1_start (matching
+    // run_parallel_pipeline and run_adaptive_pipeline) so that fingerprinting_ms
+    // measures strictly SimHash fingerprinting across all pipelines, while
+    // remaining included in total_pipeline_ms.
     std::unordered_map<uint64_t, size_t> id_to_index;
     id_to_index.reserve(num_docs);
 
@@ -81,19 +80,25 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
                 std::to_string(doc.id) + "). All document IDs must be unique."
             );
         }
-        result.document_ids.push_back(doc.id);
-        result.fingerprints.push_back(compute_simhash(doc.text, config.shingle_size));
+        result.document_ids[i] = doc.id;
     }
 
-    auto t1_end = Clock::now();
-    result.timings.fingerprinting_ms = std::chrono::duration<double, std::milli>(
-        t1_end - t1_start
-    ).count();
+    // -------------------------------------------------------------
+    // Stage 1: Document Fingerprinting
+    // -------------------------------------------------------------
+    auto t1_start = SteadyClock::now();
+
+    for (size_t i = 0; i < num_docs; ++i) {
+        result.fingerprints[i] = compute_simhash(documents[i].text, config.shingle_size);
+    }
+
+    auto t1_end = SteadyClock::now();
+    result.timings.fingerprinting_ms = elapsed_ms(t1_start, t1_end);
 
     // -------------------------------------------------------------
     // Stage 2: Band Bucket Construction
     // -------------------------------------------------------------
-    auto t2_start = Clock::now();
+    auto t2_start = SteadyClock::now();
 
     // 8 bands, each with 256 buckets (possible values 0..255).
     // buckets_table[band][value] stores the list of document IDs mapped to that bucket.
@@ -178,15 +183,13 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
         result.workload_stats.cv_estimated_pair_work = 0.0;
     }
 
-    auto t2_end = Clock::now();
-    result.timings.bucket_construction_ms = std::chrono::duration<double, std::milli>(
-        t2_end - t2_start
-    ).count();
+    auto t2_end = SteadyClock::now();
+    result.timings.bucket_construction_ms = elapsed_ms(t2_start, t2_end);
 
     // -------------------------------------------------------------
     // Stage 3: Candidate Generation & Deduplication
     // -------------------------------------------------------------
-    auto t3_start = Clock::now();
+    auto t3_start = SteadyClock::now();
 
     std::vector<CandidatePair> raw_candidates;
     size_t units_processed = 0;
@@ -226,15 +229,13 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
     );
     result.candidate_pairs = std::move(raw_candidates);
 
-    auto t3_end = Clock::now();
-    result.timings.candidate_generation_dedup_ms = std::chrono::duration<double, std::milli>(
-        t3_end - t3_start
-    ).count();
+    auto t3_end = SteadyClock::now();
+    result.timings.candidate_generation_dedup_ms = elapsed_ms(t3_start, t3_end);
 
     // -------------------------------------------------------------
     // Stage 4: Hamming Distance Verification
     // -------------------------------------------------------------
-    auto t4_start = Clock::now();
+    auto t4_start = SteadyClock::now();
 
     for (const auto& candidate : result.candidate_pairs) {
         size_t idx1 = id_to_index[candidate.first];
@@ -250,15 +251,11 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
     }
 
     // Verified pairs inherit deterministic order from candidate_pairs
-    auto t4_end = Clock::now();
-    result.timings.verification_ms = std::chrono::duration<double, std::milli>(
-        t4_end - t4_start
-    ).count();
+    auto t4_end = SteadyClock::now();
+    result.timings.verification_ms = elapsed_ms(t4_start, t4_end);
 
-    auto pipeline_end = Clock::now();
-    result.timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
-        pipeline_end - pipeline_start
-    ).count();
+    auto pipeline_end = SteadyClock::now();
+    result.timings.total_pipeline_ms = elapsed_ms(pipeline_start, pipeline_end);
 
     return result;
 }

@@ -107,8 +107,7 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // RAII guard safely sets requested OpenMP runtime schedule and restores prior state on return/exception
     detail::OmpScheduleGuard schedule_guard(config.schedule_policy, config.chunk_size);
 
-    using Clock = std::chrono::high_resolution_clock;
-    auto pipeline_start = Clock::now();
+    auto pipeline_start = SteadyClock::now();
 
     PipelineResult result;
     size_t num_docs = documents.size();
@@ -119,10 +118,8 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
         result.actual_thread_count = 0;
         result.per_thread_pair_work.assign(static_cast<size_t>(config.thread_count), 0ULL);
         result.per_thread_units_processed.assign(static_cast<size_t>(config.thread_count), 0);
-        auto pipeline_end = Clock::now();
-        result.timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
-            pipeline_end - pipeline_start
-        ).count();
+        auto pipeline_end = SteadyClock::now();
+        result.timings.total_pipeline_ms = elapsed_ms(pipeline_start, pipeline_end);
         return result;
     }
 
@@ -131,6 +128,8 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // -------------------------------------------------------------
     // Map each document ID to its position in the arrays to guarantee unique IDs
     // and enable fast O(1) fingerprint lookup during candidate verification.
+    // Note: This sequential validation step runs before t1_start so that
+    // fingerprinting_ms measures strictly the OpenMP parallel fingerprinting loop.
     std::unordered_map<uint64_t, size_t> id_to_index;
     id_to_index.reserve(num_docs);
 
@@ -154,7 +153,7 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // - Preallocated vector `result.fingerprints` of exact size `num_docs`.
     // - Thread i writes strictly to its disjoint memory cell `result.fingerprints[i]`.
     // - No shared mutable state or critical sections required.
-    auto t1_start = Clock::now();
+    auto t1_start = SteadyClock::now();
 
     #pragma omp parallel for num_threads(config.thread_count) schedule(runtime) default(none) \
         shared(documents, result, config, num_docs)
@@ -162,10 +161,8 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
         result.fingerprints[i] = compute_simhash(documents[i].text, config.base_config.shingle_size);
     }
 
-    auto t1_end = Clock::now();
-    result.timings.fingerprinting_ms = std::chrono::duration<double, std::milli>(
-        t1_end - t1_start
-    ).count();
+    auto t1_end = SteadyClock::now();
+    result.timings.fingerprinting_ms = elapsed_ms(t1_start, t1_end);
 
     // -------------------------------------------------------------
     // Stage 2: Band Bucket Construction & Workload Statistics
@@ -175,7 +172,7 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // With 8 bands and 256 bucket slots per band, total bucket count is small (2048).
     // Sequential insertion is extremely fast (< 0.2 ms for 100K docs) and completely
     // eliminates concurrent write locks or multi-hash contention across threads.
-    auto t2_start = Clock::now();
+    auto t2_start = SteadyClock::now();
 
     std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_table;
 
@@ -262,10 +259,8 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
         result.workload_stats.cv_estimated_pair_work = 0.0;
     }
 
-    auto t2_end = Clock::now();
-    result.timings.bucket_construction_ms = std::chrono::duration<double, std::milli>(
-        t2_end - t2_start
-    ).count();
+    auto t2_end = SteadyClock::now();
+    result.timings.bucket_construction_ms = elapsed_ms(t2_start, t2_end);
 
     // -------------------------------------------------------------
     // Stage 3: Parallel Candidate Generation & Deduplication
@@ -281,7 +276,7 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // - After parallel loop, per-thread slots are sequentially concatenated.
     // - Final candidates are sorted and deduplicated via std::unique to guarantee
     //   bitwise-deterministic candidate ordering identical to sequential execution.
-    auto t3_start = Clock::now();
+    auto t3_start = SteadyClock::now();
 
     size_t num_active_buckets = active_buckets.size();
     std::vector<std::vector<CandidatePair>> per_thread_candidates(config.thread_count);
@@ -356,10 +351,8 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     );
     result.candidate_pairs = std::move(raw_candidates);
 
-    auto t3_end = Clock::now();
-    result.timings.candidate_generation_dedup_ms = std::chrono::duration<double, std::milli>(
-        t3_end - t3_start
-    ).count();
+    auto t3_end = SteadyClock::now();
+    result.timings.candidate_generation_dedup_ms = elapsed_ms(t3_start, t3_end);
 
     // -------------------------------------------------------------
     // Stage 4: Parallel Hamming Distance Verification
@@ -372,7 +365,7 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // - After parallel loop, per-thread slots are sequentially concatenated and sorted
     //   lexicographically to preserve exact, bitwise-deterministic ordering matching
     //   the sequential reference pipeline.
-    auto t4_start = Clock::now();
+    auto t4_start = SteadyClock::now();
 
     size_t num_candidates = result.candidate_pairs.size();
     std::vector<std::vector<VerifiedPair>> per_thread_verified(config.thread_count);
@@ -424,15 +417,11 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // Sort to guarantee deterministic ordering matching sequential pipeline
     std::sort(result.verified_pairs.begin(), result.verified_pairs.end());
 
-    auto t4_end = Clock::now();
-    result.timings.verification_ms = std::chrono::duration<double, std::milli>(
-        t4_end - t4_start
-    ).count();
+    auto t4_end = SteadyClock::now();
+    result.timings.verification_ms = elapsed_ms(t4_start, t4_end);
 
-    auto pipeline_end = Clock::now();
-    result.timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
-        pipeline_end - pipeline_start
-    ).count();
+    auto pipeline_end = SteadyClock::now();
+    result.timings.total_pipeline_ms = elapsed_ms(pipeline_start, pipeline_end);
 
     return result;
 }
@@ -629,8 +618,7 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
                                              const AdaptiveConfig& config) {
     config.validate();
 
-    using Clock = std::chrono::high_resolution_clock;
-    auto pipeline_start = Clock::now();
+    auto pipeline_start = SteadyClock::now();
 
     AdaptivePipelineResult adaptive_res;
     PipelineResult& result = adaptive_res.pipeline_result;
@@ -648,7 +636,7 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     result.fingerprints.resize(num_docs);
 
     if (documents.empty()) {
-        auto decision_start = Clock::now();
+        auto decision_start = SteadyClock::now();
         diag.observed_cv = 0.0;
         diag.selected_ordinary_policy = select_ordinary_schedule_policy(
             0.0, config.cv_threshold, &diag.decision_reason
@@ -659,14 +647,10 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         result.per_thread_units_processed.assign(static_cast<size_t>(config.thread_count), 0);
         diag.per_thread_pair_work = result.per_thread_pair_work;
         diag.per_thread_units_processed = result.per_thread_units_processed;
-        auto decision_end = Clock::now();
+        auto decision_end = SteadyClock::now();
 
-        timings.adaptive_decision_ms = std::chrono::duration<double, std::milli>(
-            decision_end - decision_start
-        ).count();
-        timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
-            decision_end - pipeline_start
-        ).count();
+        timings.adaptive_decision_ms = elapsed_ms(decision_start, decision_end);
+        timings.total_pipeline_ms = elapsed_ms(pipeline_start, decision_end);
         result.timings.candidate_generation_dedup_ms = timings.adaptive_decision_ms;
         result.timings.total_pipeline_ms = timings.total_pipeline_ms;
         return adaptive_res;
@@ -675,6 +659,8 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     // -------------------------------------------------------------
     // Pre-Stage Validation & ID Mapping
     // -------------------------------------------------------------
+    // Note: This sequential validation step runs before t1_start so that
+    // fingerprinting_ms measures strictly the OpenMP parallel fingerprinting loop.
     std::unordered_map<uint64_t, size_t> id_to_index;
     id_to_index.reserve(num_docs);
 
@@ -693,7 +679,7 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     // -------------------------------------------------------------
     // Stage 1: Parallel Document Fingerprinting
     // -------------------------------------------------------------
-    auto t1_start = Clock::now();
+    auto t1_start = SteadyClock::now();
     int observed_team_size = 0;
     {
         detail::OmpScheduleGuard fp_guard(SchedulePolicy::Static, 0);
@@ -713,15 +699,13 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         }
     }
     diag.actual_thread_count = observed_team_size;
-    auto t1_end = Clock::now();
-    timings.fingerprinting_ms = std::chrono::duration<double, std::milli>(
-        t1_end - t1_start
-    ).count();
+    auto t1_end = SteadyClock::now();
+    timings.fingerprinting_ms = elapsed_ms(t1_start, t1_end);
 
     // -------------------------------------------------------------
     // Stage 2: Band Bucket Construction & Workload Statistics
     // -------------------------------------------------------------
-    auto t2_start = Clock::now();
+    auto t2_start = SteadyClock::now();
 
     std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_table;
 
@@ -804,15 +788,13 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         result.workload_stats.cv_estimated_pair_work = 0.0;
     }
 
-    auto t2_end = Clock::now();
-    timings.bucket_construction_stats_ms = std::chrono::duration<double, std::milli>(
-        t2_end - t2_start
-    ).count();
+    auto t2_end = SteadyClock::now();
+    timings.bucket_construction_stats_ms = elapsed_ms(t2_start, t2_end);
 
     // -------------------------------------------------------------
     // Stage 3a: Adaptive Scheduling Decision & Bucket Classification
     // -------------------------------------------------------------
-    auto t3a_start = Clock::now();
+    auto t3a_start = SteadyClock::now();
 
     diag.occupied_buckets = result.workload_stats.occupied_buckets;
     diag.positive_work_buckets = result.workload_stats.positive_work_buckets;
@@ -847,10 +829,8 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         diag.decision_reason += " (no positive-work buckets; no oversized buckets)";
     }
 
-    auto t3a_end = Clock::now();
-    timings.adaptive_decision_ms = std::chrono::duration<double, std::milli>(
-        t3a_end - t3a_start
-    ).count();
+    auto t3a_end = SteadyClock::now();
+    timings.adaptive_decision_ms = elapsed_ms(t3a_start, t3a_end);
 
     // Preallocate per-thread candidate buffers shared across Stage 3b and Stage 3d
     size_t team_slots = static_cast<size_t>(std::max(config.thread_count, diag.actual_thread_count));
@@ -860,7 +840,7 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     // -------------------------------------------------------------
     // Stage 3b: Ordinary-Bucket Candidate Generation
     // -------------------------------------------------------------
-    auto t3b_start = Clock::now();
+    auto t3b_start = SteadyClock::now();
 
     size_t num_ordinary = ordinary_bucket_ptrs.size();
     if (num_ordinary > 0) {
@@ -905,15 +885,13 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         }
     }
 
-    auto t3b_end = Clock::now();
-    timings.ordinary_candidate_gen_ms = std::chrono::duration<double, std::milli>(
-        t3b_end - t3b_start
-    ).count();
+    auto t3b_end = SteadyClock::now();
+    timings.ordinary_candidate_gen_ms = elapsed_ms(t3b_start, t3b_end);
 
     // -------------------------------------------------------------
     // Stage 3c: Heavy-Bucket Chunk Generation
     // -------------------------------------------------------------
-    auto t3c_start = Clock::now();
+    auto t3c_start = SteadyClock::now();
 
     for (const auto& binfo : oversized_bucket_infos) {
         auto bucket_chunks = split_bucket_into_chunks(
@@ -932,15 +910,13 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     }
     diag.heavy_bucket_chunks = adaptive_res.heavy_chunks.size();
 
-    auto t3c_end = Clock::now();
-    timings.heavy_chunk_generation_ms = std::chrono::duration<double, std::milli>(
-        t3c_end - t3c_start
-    ).count();
+    auto t3c_end = SteadyClock::now();
+    timings.heavy_chunk_generation_ms = elapsed_ms(t3c_start, t3c_end);
 
     // -------------------------------------------------------------
     // Stage 3d: Heavy-Bucket Pair Processing (OpenMP Dynamic)
     // -------------------------------------------------------------
-    auto t3d_start = Clock::now();
+    auto t3d_start = SteadyClock::now();
 
     size_t num_heavy_chunks = adaptive_res.heavy_chunks.size();
     if (num_heavy_chunks > 0) {
@@ -997,15 +973,13 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         }
     }
 
-    auto t3d_end = Clock::now();
-    timings.heavy_pair_processing_ms = std::chrono::duration<double, std::milli>(
-        t3d_end - t3d_start
-    ).count();
+    auto t3d_end = SteadyClock::now();
+    timings.heavy_pair_processing_ms = elapsed_ms(t3d_start, t3d_end);
 
     // -------------------------------------------------------------
     // Stage 3e: Sequential Merge, Sort & Deduplication
     // -------------------------------------------------------------
-    auto t3e_start = Clock::now();
+    auto t3e_start = SteadyClock::now();
 
     result.actual_thread_count = diag.actual_thread_count;
     result.per_thread_pair_work.resize(per_thread_candidates.size(), 0ULL);
@@ -1038,15 +1012,13 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     );
     result.candidate_pairs = std::move(raw_candidates);
 
-    auto t3e_end = Clock::now();
-    timings.merge_sort_dedup_ms = std::chrono::duration<double, std::milli>(
-        t3e_end - t3e_start
-    ).count();
+    auto t3e_end = SteadyClock::now();
+    timings.merge_sort_dedup_ms = elapsed_ms(t3e_start, t3e_end);
 
     // -------------------------------------------------------------
     // Stage 4: Parallel Hamming Distance Verification
     // -------------------------------------------------------------
-    auto t4_start = Clock::now();
+    auto t4_start = SteadyClock::now();
 
     size_t num_candidates = result.candidate_pairs.size();
     std::vector<std::vector<VerifiedPair>> per_thread_verified(config.thread_count);
@@ -1102,15 +1074,11 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
 
     std::sort(result.verified_pairs.begin(), result.verified_pairs.end());
 
-    auto t4_end = Clock::now();
-    timings.verification_ms = std::chrono::duration<double, std::milli>(
-        t4_end - t4_start
-    ).count();
+    auto t4_end = SteadyClock::now();
+    timings.verification_ms = elapsed_ms(t4_start, t4_end);
 
-    auto pipeline_end = Clock::now();
-    timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
-        pipeline_end - pipeline_start
-    ).count();
+    auto pipeline_end = SteadyClock::now();
+    timings.total_pipeline_ms = elapsed_ms(pipeline_start, pipeline_end);
 
     // Populate summary timings on PipelineResult for compatibility with StageTimings
     result.timings.fingerprinting_ms = timings.fingerprinting_ms;

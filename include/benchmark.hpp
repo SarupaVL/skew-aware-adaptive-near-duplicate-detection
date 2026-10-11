@@ -118,6 +118,56 @@ WorkBalanceMetrics compute_work_balance_metrics(
 );
 
 /**
+ * @brief Identifies one benchmark configuration (policy + thread count) to execute on a dataset.
+ */
+struct BenchmarkConfigSpec {
+    BenchmarkPolicy policy{BenchmarkPolicy::Sequential};
+    int thread_count{1};
+
+    bool operator==(const BenchmarkConfigSpec& other) const noexcept {
+        return policy == other.policy && thread_count == other.thread_count;
+    }
+
+    bool operator!=(const BenchmarkConfigSpec& other) const noexcept {
+        return !(*this == other);
+    }
+};
+
+/**
+ * @brief Builds the canonical list of configurations evaluated for a dataset:
+ *        (Sequential, 1) followed by (Static, t), (Dynamic, t), (Guided, t), (Adaptive, t)
+ *        for each thread count t in thread_counts.
+ */
+std::vector<BenchmarkConfigSpec> build_dataset_config_specs(
+    const std::vector<int>& thread_counts
+);
+
+/**
+ * @brief Produces a deterministic, reproducible permutation of base_specs for a given
+ *        (order_seed, dataset_size, profile, round_index) using SplitMix64 seed mixing,
+ *        std::mt19937_64, and Fisher-Yates shuffling.
+ *
+ * Rationale (Phase 7):
+ * Running all repetitions of one policy consecutively before moving to the next policy
+ * introduces execution-order bias from CPU turbo/thermal drift, cache state, and transient
+ * background system load. Shuffling the configuration order within each repetition round
+ * interleaves policies across the timeline while remaining 100% reproducible from order_seed.
+ */
+std::vector<BenchmarkConfigSpec> generate_shuffled_config_order(
+    const std::vector<BenchmarkConfigSpec>& base_specs,
+    uint64_t order_seed,
+    size_t dataset_size,
+    WorkloadProfile profile,
+    size_t round_index
+);
+
+/**
+ * @brief Formats a sequence of BenchmarkConfigSpec items into a semicolon-delimited
+ *        schedule string (e.g., "Guided:4;Sequential:1;Adaptive:2;...").
+ */
+std::string format_config_order(const std::vector<BenchmarkConfigSpec>& specs);
+
+/**
  * @brief Verifies exact correctness parity between a sequential reference PipelineResult
  *        and a candidate PipelineResult (parallel fixed or adaptive).
  */
@@ -143,12 +193,16 @@ struct BenchmarkSampleRow {
     size_t shingle_size{kDefaultShingleSize};
     int hamming_threshold{kDefaultHammingThreshold};
 
-    // Execution configuration
+    // Execution configuration & deterministic order metadata (Phase 7)
     BenchmarkPolicy policy{BenchmarkPolicy::Sequential};
     int configured_threads{1};
     int actual_threads{1};
     int chunk_size{0};
     size_t repetition_index{0};
+    uint64_t order_seed{0};
+    size_t execution_order_index{0};   ///< Global 0-based chronological execution index across measured runs
+    size_t round_execution_rank{0};    ///< 0-based execution rank within the repetition round for this dataset
+    std::string round_execution_order; ///< Semicolon-delimited schedule for this round ("Policy:Threads;...")
 
     // Correctness & output counts
     bool parity_passed{true};
@@ -220,6 +274,7 @@ struct BenchmarkSummaryRow {
     int chunk_size{0};
     size_t warmup_runs{0};
     size_t measured_runs{0};
+    uint64_t order_seed{0};
 
     // Correctness & output counts
     bool parity_all_passed{true};
@@ -309,9 +364,10 @@ struct BenchmarkSuiteConfig {
     uint64_t max_pair_task_size{kDefaultMaxPairTaskSize};             ///< 4096
     int ordinary_chunk_size{0};
 
-    // Repetition parameters
+    // Repetition & execution-order parameters
     size_t warmup_runs{1};
     size_t measured_runs{5};
+    uint64_t order_seed{1337ULL}; ///< Deterministic seed for policy execution-order randomization (Phase 7)
 };
 
 /**

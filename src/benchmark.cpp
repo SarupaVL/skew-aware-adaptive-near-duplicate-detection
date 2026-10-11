@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 
@@ -295,6 +296,7 @@ BenchmarkSummaryRow summarize_benchmark_samples(
     summary.chunk_size = first.chunk_size;
     summary.warmup_runs = warmup_runs;
     summary.measured_runs = samples.size();
+    summary.order_seed = first.order_seed;
 
     summary.parity_all_passed = true;
     for (const auto& s : samples) {
@@ -421,6 +423,17 @@ BenchmarkSummaryRow summarize_benchmark_samples(
 
 namespace {
 
+/**
+ * @brief Platform-independent 64-bit SplitMix64 hash mixer used to derive a deterministic
+ *        per-round shuffle seed from (order_seed, dataset_size, profile, round_index).
+ */
+uint64_t splitmix64(uint64_t x) noexcept {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
 uint64_t total_bucket_pair_work(const std::vector<BucketInfo>& buckets) {
     uint64_t sum = 0;
     for (const auto& b : buckets) {
@@ -436,6 +449,10 @@ BenchmarkSampleRow build_sample_row(
     int configured_threads,
     int chunk_size,
     size_t rep_idx,
+    uint64_t order_seed,
+    size_t execution_order_index,
+    size_t round_execution_rank,
+    const std::string& round_execution_order,
     const PipelineResult& res,
     const AdaptivePipelineResult* adap_ptr,
     bool parity_ok
@@ -458,6 +475,10 @@ BenchmarkSampleRow build_sample_row(
     row.actual_threads = res.actual_thread_count;
     row.chunk_size = chunk_size;
     row.repetition_index = rep_idx;
+    row.order_seed = order_seed;
+    row.execution_order_index = execution_order_index;
+    row.round_execution_rank = round_execution_rank;
+    row.round_execution_order = round_execution_order;
 
     row.parity_passed = parity_ok;
     row.candidate_pairs_count = res.candidate_pairs.size();
@@ -533,6 +554,81 @@ BenchmarkSampleRow build_sample_row(
 
 } // namespace
 
+std::vector<BenchmarkConfigSpec> build_dataset_config_specs(
+    const std::vector<int>& thread_counts
+) {
+    if (thread_counts.empty()) {
+        throw std::invalid_argument("build_dataset_config_specs: thread_counts cannot be empty.");
+    }
+    for (int t : thread_counts) {
+        if (t <= 0) {
+            throw std::invalid_argument(
+                "build_dataset_config_specs: thread_count must be positive (got " +
+                std::to_string(t) + ")."
+            );
+        }
+    }
+
+    std::vector<BenchmarkConfigSpec> specs;
+    specs.reserve(1 + 4 * thread_counts.size());
+
+    // 1. Sequential reference baseline (1 thread)
+    specs.push_back(BenchmarkConfigSpec{BenchmarkPolicy::Sequential, 1});
+
+    // 2. Parallel policies across all requested thread counts in canonical order
+    const std::vector<BenchmarkPolicy> parallel_policies = {
+        BenchmarkPolicy::Static,
+        BenchmarkPolicy::Dynamic,
+        BenchmarkPolicy::Guided,
+        BenchmarkPolicy::Adaptive
+    };
+    for (BenchmarkPolicy policy : parallel_policies) {
+        for (int t : thread_counts) {
+            specs.push_back(BenchmarkConfigSpec{policy, t});
+        }
+    }
+    return specs;
+}
+
+std::vector<BenchmarkConfigSpec> generate_shuffled_config_order(
+    const std::vector<BenchmarkConfigSpec>& base_specs,
+    uint64_t order_seed,
+    size_t dataset_size,
+    WorkloadProfile profile,
+    size_t round_index
+) {
+    std::vector<BenchmarkConfigSpec> shuffled = base_specs;
+    if (shuffled.size() <= 1) {
+        return shuffled;
+    }
+
+    // Deterministically mix (order_seed, dataset_size, profile, round_index) into a 64-bit seed.
+    // Using std::mt19937_64 with explicit Fisher-Yates index selection guarantees identical
+    // permutations across compilers and standard library implementations.
+    uint64_t mixed = splitmix64(order_seed);
+    mixed = splitmix64(mixed ^ static_cast<uint64_t>(dataset_size));
+    mixed = splitmix64(mixed ^ (static_cast<uint64_t>(profile) + 0x517cc1b727220a95ULL));
+    mixed = splitmix64(mixed ^ static_cast<uint64_t>(round_index));
+
+    std::mt19937_64 rng(mixed);
+    for (size_t i = shuffled.size() - 1; i > 0; --i) {
+        size_t j = static_cast<size_t>(rng() % static_cast<uint64_t>(i + 1));
+        std::swap(shuffled[i], shuffled[j]);
+    }
+    return shuffled;
+}
+
+std::string format_config_order(const std::vector<BenchmarkConfigSpec>& specs) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < specs.size(); ++i) {
+        if (i > 0) {
+            oss << ';';
+        }
+        oss << to_string(specs[i].policy) << ':' << specs[i].thread_count;
+    }
+    return oss.str();
+}
+
 BenchmarkSuiteResult run_benchmark_suite(
     const BenchmarkSuiteConfig& suite_cfg,
     std::ostream* progress_os
@@ -550,7 +646,11 @@ BenchmarkSuiteResult run_benchmark_suite(
         throw std::invalid_argument("run_benchmark_suite: measured_runs must be at least 1.");
     }
 
+    const std::vector<BenchmarkConfigSpec> base_specs =
+        build_dataset_config_specs(suite_cfg.thread_counts);
+
     BenchmarkSuiteResult suite_res;
+    size_t global_execution_order_index = 0;
 
     for (size_t dsize : suite_cfg.dataset_sizes) {
         for (WorkloadProfile profile : suite_cfg.profiles) {
@@ -569,51 +669,153 @@ BenchmarkSuiteResult run_benchmark_suite(
                 *progress_os << "\n===============================================================\n"
                              << " Dataset: N=" << dsize
                              << " | Profile=" << to_string(profile)
-                             << " | Seed=" << dcfg.random_seed << "\n"
+                             << " | Seed=" << dcfg.random_seed
+                             << " | OrderSeed=" << suite_cfg.order_seed << "\n"
                              << "===============================================================\n";
             }
 
             // Generate dataset ONCE per (dataset_size, profile, seed) and reuse across all runs
             const std::vector<Document> dataset = generate_dataset(dcfg);
 
-            // 1. Sequential Reference Baseline (1 thread)
-            PipelineResult reference_seq_result;
-            for (size_t w = 0; w < suite_cfg.warmup_runs; ++w) {
-                reference_seq_result = run_sequential_pipeline(dataset, suite_cfg.pipeline_config);
-            }
+            // Compute the sequential reference result independently BEFORE randomized rounds
+            // so that every warm-up and measured run in any randomized execution order is
+            // verified against an authoritative sequential reference.
+            const PipelineResult reference_seq_result =
+                run_sequential_pipeline(dataset, suite_cfg.pipeline_config);
 
-            std::vector<BenchmarkSampleRow> seq_samples;
-            seq_samples.reserve(suite_cfg.measured_runs);
+            // Helper lambda to run a single BenchmarkConfigSpec on `dataset` and verify parity
+            auto run_and_verify_spec = [&](const BenchmarkConfigSpec& spec,
+                                           const std::string& phase_label,
+                                           PipelineResult& out_res,
+                                           AdaptivePipelineResult& out_adap,
+                                           bool& out_is_adaptive,
+                                           int& out_chunk_size) -> ParityCheckResult {
+                out_is_adaptive = false;
+                out_chunk_size = 0;
 
-            for (size_t r = 0; r < suite_cfg.measured_runs; ++r) {
-                PipelineResult seq_run = run_sequential_pipeline(dataset, suite_cfg.pipeline_config);
-                if (r == 0 && suite_cfg.warmup_runs == 0) {
-                    reference_seq_result = seq_run;
+                if (spec.policy == BenchmarkPolicy::Sequential) {
+                    out_res = run_sequential_pipeline(dataset, suite_cfg.pipeline_config);
+                } else if (spec.policy == BenchmarkPolicy::Adaptive) {
+                    out_is_adaptive = true;
+                    AdaptiveConfig acfg;
+                    acfg.base_config = suite_cfg.pipeline_config;
+                    acfg.thread_count = spec.thread_count;
+                    acfg.cv_threshold = suite_cfg.cv_threshold;
+                    acfg.oversized_bucket_multiplier = suite_cfg.oversized_bucket_multiplier;
+                    acfg.max_pair_task_size = suite_cfg.max_pair_task_size;
+                    acfg.ordinary_chunk_size = suite_cfg.ordinary_chunk_size;
+                    out_chunk_size = static_cast<int>(acfg.max_pair_task_size);
+
+                    out_adap = run_adaptive_pipeline(dataset, acfg);
+                    out_res = out_adap.pipeline_result;
+                } else {
+                    ParallelConfig pcfg;
+                    pcfg.base_config = suite_cfg.pipeline_config;
+                    pcfg.thread_count = spec.thread_count;
+                    pcfg.chunk_size = suite_cfg.fixed_chunk_size;
+                    out_chunk_size = pcfg.chunk_size;
+                    if (spec.policy == BenchmarkPolicy::Static) {
+                        pcfg.schedule_policy = SchedulePolicy::Static;
+                    } else if (spec.policy == BenchmarkPolicy::Dynamic) {
+                        pcfg.schedule_policy = SchedulePolicy::Dynamic;
+                    } else {
+                        pcfg.schedule_policy = SchedulePolicy::Guided;
+                    }
+
+                    out_res = run_parallel_pipeline(dataset, pcfg);
                 }
-                ParityCheckResult parity = verify_pipeline_parity(reference_seq_result, seq_run);
+
+                ParityCheckResult parity = verify_pipeline_parity(reference_seq_result, out_res);
                 if (!parity.passed) {
                     throw std::runtime_error(
-                        "Sequential self-parity check failed: " + parity.failure_reason
+                        "Parity failure during " + std::string(to_string(spec.policy)) + " " +
+                        phase_label + " (N=" + std::to_string(dsize) + ", T=" +
+                        std::to_string(spec.thread_count) + "): " + parity.failure_reason
                     );
                 }
+                return parity;
+            };
 
-                BenchmarkSampleRow row = build_sample_row(
-                    dcfg,
-                    suite_cfg.pipeline_config,
-                    BenchmarkPolicy::Sequential,
-                    1,
-                    0,
-                    r,
-                    seq_run,
-                    nullptr,
-                    parity.passed
-                );
-                seq_samples.push_back(row);
-                suite_res.raw_samples.push_back(row);
+            // 1. Interleaved / Randomized Warm-up Rounds (also verified for parity)
+            for (size_t w = 0; w < suite_cfg.warmup_runs; ++w) {
+                const std::vector<BenchmarkConfigSpec> warm_order =
+                    generate_shuffled_config_order(base_specs, suite_cfg.order_seed, dsize, profile, w);
+                for (const auto& spec : warm_order) {
+                    PipelineResult warm_res;
+                    AdaptivePipelineResult warm_adap;
+                    bool is_adap = false;
+                    int chunk_sz = 0;
+                    run_and_verify_spec(
+                        spec,
+                        "warm-up[" + std::to_string(w) + "]",
+                        warm_res,
+                        warm_adap,
+                        is_adap,
+                        chunk_sz
+                    );
+                }
             }
 
+            // 2. Interleaved / Randomized Measured Repetition Rounds
+            std::vector<std::vector<BenchmarkSampleRow>> samples_by_canonical_idx(base_specs.size());
+            for (auto& vec : samples_by_canonical_idx) {
+                vec.reserve(suite_cfg.measured_runs);
+            }
+
+            for (size_t r = 0; r < suite_cfg.measured_runs; ++r) {
+                const size_t round_idx = suite_cfg.warmup_runs + r;
+                const std::vector<BenchmarkConfigSpec> round_order =
+                    generate_shuffled_config_order(
+                        base_specs, suite_cfg.order_seed, dsize, profile, round_idx
+                    );
+                const std::string round_order_str = format_config_order(round_order);
+
+                for (size_t rank = 0; rank < round_order.size(); ++rank) {
+                    const BenchmarkConfigSpec& spec = round_order[rank];
+                    PipelineResult run_res;
+                    AdaptivePipelineResult run_adap;
+                    bool is_adap = false;
+                    int chunk_sz = 0;
+
+                    ParityCheckResult parity = run_and_verify_spec(
+                        spec,
+                        "rep[" + std::to_string(r) + "]",
+                        run_res,
+                        run_adap,
+                        is_adap,
+                        chunk_sz
+                    );
+
+                    BenchmarkSampleRow row = build_sample_row(
+                        dcfg,
+                        suite_cfg.pipeline_config,
+                        spec.policy,
+                        spec.thread_count,
+                        chunk_sz,
+                        r,
+                        suite_cfg.order_seed,
+                        global_execution_order_index++,
+                        rank,
+                        round_order_str,
+                        run_res,
+                        is_adap ? &run_adap : nullptr,
+                        parity.passed
+                    );
+
+                    suite_res.raw_samples.push_back(row);
+
+                    auto it = std::find(base_specs.begin(), base_specs.end(), spec);
+                    if (it != base_specs.end()) {
+                        size_t canonical_idx = static_cast<size_t>(std::distance(base_specs.begin(), it));
+                        samples_by_canonical_idx[canonical_idx].push_back(row);
+                    }
+                }
+            }
+
+            // 3. Summarize in canonical order: Sequential first (to establish seq_median_total_ms
+            //    and seq_median_cand_ms), followed by Static, Dynamic, Guided, and Adaptive.
             BenchmarkSummaryRow seq_summary = summarize_benchmark_samples(
-                seq_samples,
+                samples_by_canonical_idx[0],
                 suite_cfg.warmup_runs,
                 0.0,
                 0.0
@@ -631,152 +833,28 @@ BenchmarkSuiteResult run_benchmark_suite(
                              << " | CV=" << std::setprecision(4) << seq_summary.bucket_work_cv << "\n";
             }
 
-            // 2. Parallel Policies: Static, Dynamic, Guided, Adaptive across thread_counts
-            const std::vector<BenchmarkPolicy> parallel_policies = {
-                BenchmarkPolicy::Static,
-                BenchmarkPolicy::Dynamic,
-                BenchmarkPolicy::Guided,
-                BenchmarkPolicy::Adaptive
-            };
+            for (size_t idx = 1; idx < base_specs.size(); ++idx) {
+                BenchmarkSummaryRow summary = summarize_benchmark_samples(
+                    samples_by_canonical_idx[idx],
+                    suite_cfg.warmup_runs,
+                    seq_median_total_ms,
+                    seq_median_cand_ms
+                );
+                suite_res.summary_rows.push_back(summary);
 
-            for (BenchmarkPolicy policy : parallel_policies) {
-                for (int threads : suite_cfg.thread_counts) {
-                    std::vector<BenchmarkSampleRow> config_samples;
-                    config_samples.reserve(suite_cfg.measured_runs);
-
-                    if (policy == BenchmarkPolicy::Adaptive) {
-                        AdaptiveConfig acfg;
-                        acfg.base_config = suite_cfg.pipeline_config;
-                        acfg.thread_count = threads;
-                        acfg.cv_threshold = suite_cfg.cv_threshold;
-                        acfg.oversized_bucket_multiplier = suite_cfg.oversized_bucket_multiplier;
-                        acfg.max_pair_task_size = suite_cfg.max_pair_task_size;
-                        acfg.ordinary_chunk_size = suite_cfg.ordinary_chunk_size;
-
-                        // Warm-up runs (also verified for parity!)
-                        for (size_t w = 0; w < suite_cfg.warmup_runs; ++w) {
-                            AdaptivePipelineResult warm_res = run_adaptive_pipeline(dataset, acfg);
-                            ParityCheckResult parity = verify_pipeline_parity(
-                                reference_seq_result, warm_res.pipeline_result
-                            );
-                            if (!parity.passed) {
-                                throw std::runtime_error(
-                                    "Parity failure during Adaptive warm-up (N=" +
-                                    std::to_string(dsize) + ", T=" + std::to_string(threads) +
-                                    "): " + parity.failure_reason
-                                );
-                            }
-                        }
-
-                        // Measured runs
-                        for (size_t r = 0; r < suite_cfg.measured_runs; ++r) {
-                            AdaptivePipelineResult adap_res = run_adaptive_pipeline(dataset, acfg);
-                            ParityCheckResult parity = verify_pipeline_parity(
-                                reference_seq_result, adap_res.pipeline_result
-                            );
-                            if (!parity.passed) {
-                                throw std::runtime_error(
-                                    "Parity failure during Adaptive run (N=" +
-                                    std::to_string(dsize) + ", T=" + std::to_string(threads) +
-                                    ", rep=" + std::to_string(r) + "): " + parity.failure_reason
-                                );
-                            }
-
-                            BenchmarkSampleRow row = build_sample_row(
-                                dcfg,
-                                suite_cfg.pipeline_config,
-                                BenchmarkPolicy::Adaptive,
-                                threads,
-                                static_cast<int>(acfg.max_pair_task_size),
-                                r,
-                                adap_res.pipeline_result,
-                                &adap_res,
-                                parity.passed
-                            );
-                            config_samples.push_back(row);
-                            suite_res.raw_samples.push_back(row);
-                        }
-                    } else {
-                        ParallelConfig pcfg;
-                        pcfg.base_config = suite_cfg.pipeline_config;
-                        pcfg.thread_count = threads;
-                        pcfg.chunk_size = suite_cfg.fixed_chunk_size;
-                        if (policy == BenchmarkPolicy::Static) {
-                            pcfg.schedule_policy = SchedulePolicy::Static;
-                        } else if (policy == BenchmarkPolicy::Dynamic) {
-                            pcfg.schedule_policy = SchedulePolicy::Dynamic;
-                        } else {
-                            pcfg.schedule_policy = SchedulePolicy::Guided;
-                        }
-
-                        // Warm-up runs (also verified for parity!)
-                        for (size_t w = 0; w < suite_cfg.warmup_runs; ++w) {
-                            PipelineResult warm_res = run_parallel_pipeline(dataset, pcfg);
-                            ParityCheckResult parity = verify_pipeline_parity(
-                                reference_seq_result, warm_res
-                            );
-                            if (!parity.passed) {
-                                throw std::runtime_error(
-                                    "Parity failure during " + std::string(to_string(policy)) +
-                                    " warm-up (N=" + std::to_string(dsize) + ", T=" +
-                                    std::to_string(threads) + "): " + parity.failure_reason
-                                );
-                            }
-                        }
-
-                        // Measured runs
-                        for (size_t r = 0; r < suite_cfg.measured_runs; ++r) {
-                            PipelineResult par_res = run_parallel_pipeline(dataset, pcfg);
-                            ParityCheckResult parity = verify_pipeline_parity(
-                                reference_seq_result, par_res
-                            );
-                            if (!parity.passed) {
-                                throw std::runtime_error(
-                                    "Parity failure during " + std::string(to_string(policy)) +
-                                    " run (N=" + std::to_string(dsize) + ", T=" +
-                                    std::to_string(threads) + ", rep=" + std::to_string(r) +
-                                    "): " + parity.failure_reason
-                                );
-                            }
-
-                            BenchmarkSampleRow row = build_sample_row(
-                                dcfg,
-                                suite_cfg.pipeline_config,
-                                policy,
-                                threads,
-                                pcfg.chunk_size,
-                                r,
-                                par_res,
-                                nullptr,
-                                parity.passed
-                            );
-                            config_samples.push_back(row);
-                            suite_res.raw_samples.push_back(row);
-                        }
-                    }
-
-                    BenchmarkSummaryRow summary = summarize_benchmark_samples(
-                        config_samples,
-                        suite_cfg.warmup_runs,
-                        seq_median_total_ms,
-                        seq_median_cand_ms
-                    );
-                    suite_res.summary_rows.push_back(summary);
-
-                    if (progress_os != nullptr) {
-                        *progress_os << "  [" << std::setw(10) << std::left << to_string(policy)
-                                     << std::right << " | T=" << threads << "] "
-                                     << "Median=" << std::fixed << std::setprecision(3)
-                                     << std::setw(7) << summary.median_total_ms << " ms "
-                                     << "(IQR=" << std::setw(5) << summary.iqr_total_ms << ") | "
-                                     << "Speedup=" << std::setprecision(2) << std::setw(4)
-                                     << summary.speedup_total << "x | "
-                                     << "Eff=" << std::setw(4) << summary.efficiency_total << " | "
-                                     << "Imbalance I=" << std::setprecision(2) << std::setw(4)
-                                     << summary.work_imbalance_ratio
-                                     << " (Part=" << summary.participating_threads << "/"
-                                     << summary.configured_threads << ")\n";
-                    }
+                if (progress_os != nullptr) {
+                    *progress_os << "  [" << std::setw(10) << std::left << to_string(summary.policy)
+                                 << std::right << " | T=" << summary.configured_threads << "] "
+                                 << "Median=" << std::fixed << std::setprecision(3)
+                                 << std::setw(7) << summary.median_total_ms << " ms "
+                                 << "(IQR=" << std::setw(5) << summary.iqr_total_ms << ") | "
+                                 << "Speedup=" << std::setprecision(2) << std::setw(4)
+                                 << summary.speedup_total << "x | "
+                                 << "Eff=" << std::setw(4) << summary.efficiency_total << " | "
+                                 << "Imbalance I=" << std::setprecision(2) << std::setw(4)
+                                 << summary.work_imbalance_ratio
+                                 << " (Part=" << summary.participating_threads << "/"
+                                 << summary.configured_threads << ")\n";
                 }
             }
         }
@@ -789,7 +867,9 @@ void write_raw_csv(std::ostream& os, const std::vector<BenchmarkSampleRow>& rows
     os << "dataset_size,profile,random_seed,min_words,max_words,"
        << "exact_dup_ratio,modified_copy_ratio,unrelated_ratio,modification_rate,"
        << "shingle_size,hamming_threshold,policy,configured_threads,actual_threads,"
-       << "chunk_size,repetition_index,parity_passed,candidate_pairs_count,verified_pairs_count,"
+       << "chunk_size,repetition_index,order_seed,execution_order_index,"
+       << "round_execution_rank,round_execution_order,"
+       << "parity_passed,candidate_pairs_count,verified_pairs_count,"
        << "occupied_buckets,positive_work_buckets,max_bucket_size,mean_bucket_size,"
        << "total_estimated_pair_work,max_estimated_pair_work,mean_estimated_pair_work,bucket_work_cv,"
        << "selected_ordinary_policy,ordinary_buckets,ordinary_pair_work,"
@@ -819,6 +899,10 @@ void write_raw_csv(std::ostream& os, const std::vector<BenchmarkSampleRow>& rows
            << r.actual_threads << ','
            << r.chunk_size << ','
            << r.repetition_index << ','
+           << r.order_seed << ','
+           << r.execution_order_index << ','
+           << r.round_execution_rank << ','
+           << '"' << r.round_execution_order << '"' << ','
            << (r.parity_passed ? 1 : 0) << ','
            << r.candidate_pairs_count << ','
            << r.verified_pairs_count << ','
@@ -862,7 +946,7 @@ void write_summary_csv(std::ostream& os, const std::vector<BenchmarkSummaryRow>&
     os << "dataset_size,profile,random_seed,min_words,max_words,"
        << "exact_dup_ratio,modified_copy_ratio,unrelated_ratio,modification_rate,"
        << "shingle_size,hamming_threshold,policy,configured_threads,actual_threads,"
-       << "chunk_size,warmup_runs,measured_runs,parity_all_passed,"
+       << "chunk_size,warmup_runs,measured_runs,order_seed,parity_all_passed,"
        << "candidate_pairs_count,verified_pairs_count,"
        << "occupied_buckets,positive_work_buckets,max_bucket_size,mean_bucket_size,"
        << "total_estimated_pair_work,max_estimated_pair_work,mean_estimated_pair_work,bucket_work_cv,"
@@ -898,6 +982,7 @@ void write_summary_csv(std::ostream& os, const std::vector<BenchmarkSummaryRow>&
            << r.chunk_size << ','
            << r.warmup_runs << ','
            << r.measured_runs << ','
+           << r.order_seed << ','
            << (r.parity_all_passed ? 1 : 0) << ','
            << r.candidate_pairs_count << ','
            << r.verified_pairs_count << ','
@@ -951,7 +1036,7 @@ void write_summary_csv(std::ostream& os, const std::vector<BenchmarkSummaryRow>&
 
 void print_summary_table(std::ostream& os, const std::vector<BenchmarkSummaryRow>& rows) {
     os << "\n========================================================================================================================\n";
-    os << " Phase 6 Benchmark Summary Table (Medians Across Measured Repetitions)\n";
+    os << " Phase 7 Benchmark Summary Table (Medians Across Measured Repetitions)\n";
     os << "========================================================================================================================\n";
     os << "   N  | Profile  | Policy     | Th | Total(ms) | IQR(ms) | CandGen(ms) | Speedup | Effic | Imbal(I) | OvBkt | Chunks | Parity\n";
     os << "------------------------------------------------------------------------------------------------------------------------\n";

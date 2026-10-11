@@ -155,6 +155,7 @@ void test_mini_benchmark_suite_and_csv_export() {
     suite_cfg.thread_counts = {1, 2, 4};
     suite_cfg.warmup_runs = 1;
     suite_cfg.measured_runs = 2;
+    suite_cfg.order_seed = 1337ULL;
 
     BenchmarkSuiteResult res = run_benchmark_suite(suite_cfg, nullptr);
 
@@ -167,36 +168,178 @@ void test_mini_benchmark_suite_and_csv_export() {
 
     for (const auto& s : res.summary_rows) {
         check(s.parity_all_passed, "test_suite_all_parity_passed", "Every summary row must pass parity.");
-        check(s.median_total_ms > 0.0, "test_suite_positive_runtime", "Median total time must be positive.");
+        check(s.order_seed == 1337ULL, "test_suite_summary_order_seed", "Summary row must record order_seed.");
+        check(std::isfinite(s.median_total_ms) && s.median_total_ms > 0.0,
+              "test_suite_positive_runtime", "Median total time must be finite and positive.");
         check(s.work_imbalance_ratio >= 1.0 - 1e-9, "test_suite_imbalance_ge_1",
               "Work imbalance ratio I must be >= 1.0.");
     }
 
     std::ostringstream raw_csv;
     write_raw_csv(raw_csv, res.raw_samples);
-    check(raw_csv.str().find("dataset_size,profile,random_seed") == 0,
+    const std::string raw_str = raw_csv.str();
+    check(raw_str.find("dataset_size,profile,random_seed") == 0,
           "test_raw_csv_header", "Raw CSV header missing or malformed.");
+    check(raw_str.find("order_seed,execution_order_index,round_execution_rank,round_execution_order") != std::string::npos,
+          "test_raw_csv_order_metadata_columns", "Raw CSV header must include Phase 7 order metadata columns.");
 
     std::ostringstream sum_csv;
     write_summary_csv(sum_csv, res.summary_rows);
-    check(sum_csv.str().find("speedup_total,efficiency_total") != std::string::npos,
+    const std::string sum_str = sum_csv.str();
+    check(sum_str.find("speedup_total,efficiency_total") != std::string::npos,
           "test_summary_csv_header", "Summary CSV header missing speedup/efficiency columns.");
+    check(sum_str.find("warmup_runs,measured_runs,order_seed,parity_all_passed") != std::string::npos,
+          "test_summary_csv_order_seed_column", "Summary CSV header must include order_seed column.");
+}
+
+void test_phase7_execution_order_and_timing_reliability() {
+    const std::vector<int> threads = {1, 2, 4, 8};
+    const std::vector<BenchmarkConfigSpec> base_specs = build_dataset_config_specs(threads);
+
+    // 1 Sequential + 4 parallel policies * 4 thread counts = 17 configurations
+    check(base_specs.size() == 17, "test_base_specs_count",
+          "Expected 17 canonical configs for thread_counts={1,2,4,8}.");
+
+    // 1. Deterministic order for a fixed seed
+    auto order_a1 = generate_shuffled_config_order(
+        base_specs, 1337ULL, 500, WorkloadProfile::Skewed, 0
+    );
+    auto order_a2 = generate_shuffled_config_order(
+        base_specs, 1337ULL, 500, WorkloadProfile::Skewed, 0
+    );
+    check(order_a1 == order_a2, "test_shuffle_deterministic_same_seed",
+          "Identical seed and round parameters must produce identical policy execution order.");
+
+    // 2. Different seeds and different rounds produce different orders
+    auto order_diff_seed = generate_shuffled_config_order(
+        base_specs, 99999ULL, 500, WorkloadProfile::Skewed, 0
+    );
+    auto order_diff_round = generate_shuffled_config_order(
+        base_specs, 1337ULL, 500, WorkloadProfile::Skewed, 1
+    );
+    check(order_a1 != order_diff_seed, "test_shuffle_different_seed",
+          "Different order_seed must produce a different policy execution order.");
+    check(order_a1 != order_diff_round, "test_shuffle_different_round",
+          "Different repetition round index must produce a different policy execution order.");
+    check(order_a1 != base_specs, "test_shuffle_not_canonical",
+          "Shuffled order must differ from unshuffled canonical order.");
+
+    // 3. Every randomized execution order includes all expected policies/configs exactly once
+    for (const auto& candidate_order : {order_a1, order_diff_seed, order_diff_round}) {
+        check(candidate_order.size() == base_specs.size(),
+              "test_shuffle_preserves_size", "Shuffled order must have same size as base_specs.");
+        for (const auto& expected_spec : base_specs) {
+            size_t occurrences = 0;
+            for (const auto& item : candidate_order) {
+                if (item == expected_spec) {
+                    ++occurrences;
+                }
+            }
+            check(occurrences == 1, "test_shuffle_bijection",
+                  "Every expected (policy, thread_count) configuration must appear exactly once per round.");
+        }
+    }
+
+    // 4. End-to-end suite runs under two different order seeds on the same dataset
+    BenchmarkSuiteConfig cfg_seed1;
+    cfg_seed1.dataset_sizes = {50};
+    cfg_seed1.profiles = {WorkloadProfile::Balanced, WorkloadProfile::Skewed};
+    cfg_seed1.thread_counts = {1, 2, 4};
+    cfg_seed1.warmup_runs = 1;
+    cfg_seed1.measured_runs = 2;
+    cfg_seed1.base_seed = 42ULL;
+    cfg_seed1.order_seed = 101ULL;
+
+    BenchmarkSuiteConfig cfg_seed2 = cfg_seed1;
+    cfg_seed2.order_seed = 202ULL;
+
+    BenchmarkSuiteResult res1 = run_benchmark_suite(cfg_seed1, nullptr);
+    BenchmarkSuiteResult res2 = run_benchmark_suite(cfg_seed2, nullptr);
+
+    check(res1.raw_samples.size() == res2.raw_samples.size(),
+          "test_order_seed_raw_count_match", "Raw sample counts must match across order seeds.");
+
+    // Verify global chronological execution_order_index and round_execution_rank metadata
+    const size_t configs_per_round = 1 + 4 * cfg_seed1.thread_counts.size(); // 13
+    for (size_t i = 0; i < res1.raw_samples.size(); ++i) {
+        const auto& s = res1.raw_samples[i];
+        check(s.execution_order_index == i, "test_chronological_exec_index",
+              "execution_order_index must increment monotonically from 0.");
+        check(s.round_execution_rank == (i % configs_per_round), "test_round_execution_rank",
+              "round_execution_rank must match position within the repetition round.");
+        check(!s.round_execution_order.empty(), "test_round_execution_order_nonempty",
+              "round_execution_order string must be populated.");
+        check(s.parity_passed, "test_raw_sample_parity",
+              "Every raw sample must pass parity regardless of execution order.");
+
+        // 5. Verify all stage and total timings are finite and non-negative
+        const double timings_to_check[] = {
+            s.fingerprinting_ms,
+            s.bucket_construction_ms,
+            s.candidate_gen_total_ms,
+            s.adaptive_decision_ms,
+            s.ordinary_candidate_gen_ms,
+            s.heavy_chunk_gen_ms,
+            s.heavy_pair_proc_ms,
+            s.merge_sort_dedup_ms,
+            s.verification_ms,
+            s.total_pipeline_ms
+        };
+        for (double t_val : timings_to_check) {
+            check(std::isfinite(t_val) && t_val >= 0.0,
+                  "test_sample_timings_finite_nonnegative",
+                  "All stage and total timings must be finite and non-negative.");
+        }
+        check(s.total_pipeline_ms > 0.0, "test_sample_total_timing_positive",
+              "Total pipeline runtime must be strictly positive.");
+    }
+
+    // 6. Confirm that the two different order seeds actually executed configurations in a different order,
+    //    while evaluating the exact same dataset and producing identical deterministic detection outputs.
+    bool saw_different_chronological_policy = false;
+    for (size_t i = 0; i < res1.raw_samples.size(); ++i) {
+        if (res1.raw_samples[i].policy != res2.raw_samples[i].policy ||
+            res1.raw_samples[i].configured_threads != res2.raw_samples[i].configured_threads) {
+            saw_different_chronological_policy = true;
+            break;
+        }
+    }
+    check(saw_different_chronological_policy, "test_different_order_seeds_change_schedule",
+          "Different order_seed values must change the actual chronological execution order.");
+
+    check(res1.summary_rows.size() == res2.summary_rows.size(),
+          "test_summary_rows_count_equal", "Summary row counts must match across order seeds.");
+    for (size_t i = 0; i < res1.summary_rows.size(); ++i) {
+        const auto& sum1 = res1.summary_rows[i];
+        const auto& sum2 = res2.summary_rows[i];
+        check(sum1.policy == sum2.policy && sum1.configured_threads == sum2.configured_threads,
+              "test_summary_canonical_ordering", "Summary rows must preserve canonical (policy, threads) ordering.");
+        check(sum1.candidate_pairs_count == sum2.candidate_pairs_count &&
+              sum1.verified_pairs_count == sum2.verified_pairs_count &&
+              sum1.occupied_buckets == sum2.occupied_buckets &&
+              sum1.positive_work_buckets == sum2.positive_work_buckets &&
+              sum1.max_bucket_size == sum2.max_bucket_size &&
+              sum1.total_estimated_pair_work == sum2.total_estimated_pair_work,
+              "test_identical_dataset_and_outputs_across_orders",
+              "All policies must evaluate the exact same dataset and produce identical detection counts regardless of execution order.");
+    }
 }
 
 } // namespace
 
 int main() {
     std::cout << "========================================================\n";
-    std::cout << " Running Phase 6 Benchmark Unit Tests\n";
+    std::cout << " Running Phase 6 & Phase 7 Benchmark Unit Tests\n";
     std::cout << "========================================================\n";
 
     test_statistical_helpers();
     test_work_balance_metrics();
     test_parity_verification_and_instrumentation();
     test_mini_benchmark_suite_and_csv_export();
+    test_phase7_execution_order_and_timing_reliability();
 
     std::cout << "========================================================\n";
-    std::cout << " All Phase 6 Benchmark Tests PASSED!\n";
+    std::cout << " All Phase 6 & Phase 7 Benchmark Tests PASSED!\n";
     std::cout << "========================================================\n";
     return 0;
 }

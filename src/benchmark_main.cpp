@@ -35,7 +35,9 @@ void print_usage(const char* prog_name) {
               << "  --warmup <W>        Number of warm-up runs per configuration (default: 1)\n"
               << "  --reps <R>          Number of measured repetitions per configuration (default: 5)\n"
               << "  --seed <S>          Random seed for dataset generation (default: 42)\n"
+              << "  --order-seed <S>    Random seed for deterministic policy order shuffling (default: 1337)\n"
               << "  --out-dir <path>    Directory for CSV output files (default: results)\n"
+              << "  --out-prefix <name> Filename prefix for <prefix>_raw.csv and <prefix>_summary.csv\n"
               << "  --help              Show this help message\n";
 }
 
@@ -50,9 +52,11 @@ int main(int argc, char* argv[]) {
         suite_cfg.warmup_runs = 1;
         suite_cfg.measured_runs = 5;
         suite_cfg.base_seed = 42;
+        suite_cfg.order_seed = 1337ULL;
 
         bool is_pilot = false;
         std::string out_dir = "results";
+        std::string out_prefix;
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -69,8 +73,12 @@ int main(int argc, char* argv[]) {
                 suite_cfg.measured_runs = static_cast<size_t>(std::stoull(argv[++i]));
             } else if (arg == "--seed" && i + 1 < argc) {
                 suite_cfg.base_seed = std::stoull(argv[++i]);
+            } else if (arg == "--order-seed" && i + 1 < argc) {
+                suite_cfg.order_seed = std::stoull(argv[++i]);
             } else if (arg == "--out-dir" && i + 1 < argc) {
                 out_dir = argv[++i];
+            } else if (arg == "--out-prefix" && i + 1 < argc) {
+                out_prefix = argv[++i];
             } else if (arg == "--help" || arg == "-h") {
                 print_usage(argv[0]);
                 return 0;
@@ -82,13 +90,16 @@ int main(int argc, char* argv[]) {
         }
 
         std::filesystem::create_directories(out_dir);
-        std::string prefix = is_pilot ? "pilot" : "benchmark";
+        std::string prefix = !out_prefix.empty()
+            ? out_prefix
+            : (is_pilot ? "phase7_pilot" : "benchmark");
         std::filesystem::path raw_csv_path = std::filesystem::path(out_dir) / (prefix + "_raw.csv");
         std::filesystem::path summary_csv_path = std::filesystem::path(out_dir) / (prefix + "_summary.csv");
 
         std::cout << "===============================================================\n";
-        std::cout << " Phase 6: Reproducible Benchmarking & Performance Evaluation\n";
+        std::cout << " Phase 7: Reproducible Benchmarking & Performance Evaluation\n";
         std::cout << " Mode                 : " << (is_pilot ? "PILOT RUN" : "FULL BENCHMARK") << "\n";
+        std::cout << " Clock Source         : std::chrono::steady_clock (monotonic)\n";
         std::cout << " Logical Processors   : " << omp_get_num_procs() << "\n";
         std::cout << " Max OpenMP Threads   : " << omp_get_max_threads() << "\n";
         std::cout << " Dataset Sizes (N)    : ";
@@ -102,7 +113,8 @@ int main(int argc, char* argv[]) {
         std::cout << " Thread Counts        : 1, 2, 4, 8\n";
         std::cout << " Warm-up Runs         : " << suite_cfg.warmup_runs << "\n";
         std::cout << " Measured Repetitions : " << suite_cfg.measured_runs << "\n";
-        std::cout << " Random Seed          : " << suite_cfg.base_seed << "\n";
+        std::cout << " Dataset Seed         : " << suite_cfg.base_seed << "\n";
+        std::cout << " Execution-Order Seed : " << suite_cfg.order_seed << "\n";
         std::cout << " Word-Length Range    : [" << suite_cfg.min_words << ", " << suite_cfg.max_words << "]\n";
         std::cout << " Duplicate Ratios     : Exact=" << suite_cfg.exact_duplicate_ratio
                   << ", Modified=" << suite_cfg.modified_copy_ratio

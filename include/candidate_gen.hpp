@@ -3,12 +3,27 @@
 
 #include "document.hpp"
 #include "simhash.hpp"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <string>
 #include <utility>
 #include <vector>
+
+/**
+ * @brief Monotonic clock alias used for all elapsed-time measurements across pipelines and benchmarks.
+ *
+ * std::chrono::steady_clock is guaranteed to be monotonic and unaffected by system wall-clock adjustments.
+ */
+using SteadyClock = std::chrono::steady_clock;
+
+/**
+ * @brief Converts the duration between two SteadyClock time points into milliseconds.
+ */
+inline double elapsed_ms(SteadyClock::time_point start, SteadyClock::time_point end) noexcept {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 /**
  * @brief Default parameters for the candidate-generation pipeline.
@@ -87,7 +102,17 @@ struct WorkloadStatistics {
 };
 
 /**
- * @brief Elapsed wall-clock timings for each stage of the sequential pipeline in milliseconds.
+ * @brief Elapsed monotonic timings (std::chrono::steady_clock) for each stage of the pipeline in milliseconds.
+ *
+ * Timing Scope Notes:
+ * - Stages 1 through 4 are strictly non-overlapping intervals.
+ * - Across `run_sequential_pipeline`, `run_parallel_pipeline`, and `run_adaptive_pipeline`,
+ *   sequential `id_to_index` construction and duplicate-ID validation occur in a pre-stage step
+ *   before Stage 1 (`t1_start`) so that `fingerprinting_ms` consistently measures strictly
+ *   SimHash fingerprinting across all implementations.
+ * - `total_pipeline_ms` measures end-to-end execution from pipeline entry to return (including
+ *   initial vector allocation and pre-stage ID validation/indexing), and therefore slightly exceeds
+ *   the sum of the four individual stage timings.
  */
 struct StageTimings {
     double fingerprinting_ms{0.0};
