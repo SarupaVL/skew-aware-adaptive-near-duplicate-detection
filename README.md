@@ -6,15 +6,16 @@ This project investigates CPU-based near-duplicate document detection using SimH
 
 ---
 
-## Current Status: Phase 3 Completed
+## Current Status: Phase 4 Completed
 
 The project has completed:
 - **Phase 0:** Environment inspection, C++17 validation, and OpenMP runtime verification.
 - **Phase 1:** In-memory document data model, ground-truth duplicate cluster semantics, and deterministic synthetic dataset generator.
 - **Phase 2:** 64-bit SimHash locality-sensitive fingerprinting, deterministic FNV-1a hashing, token shingling, and bitwise Hamming distance computation.
 - **Phase 3:** Deterministic sequential near-duplicate detection pipeline: 8-band / 8-bit candidate generation, pair deduplication, Hamming-distance verification, bucket workload statistics, and stage timings.
+- **Phase 4:** OpenMP parallelization and scheduling baselines (`static`, `dynamic`, `guided`), race-free thread-local pair accumulation, deterministic output matching sequential ground truth, and configurable thread scaling.
 
-*(Parallel execution—OpenMP static, dynamic, guided, and adaptive scheduling—is part of subsequent phases and is not yet implemented. The pipeline at this stage is strictly sequential to establish the correctness baseline.)*
+*(Adaptive scheduling—workload-aware task splitting of large candidate groups—is part of subsequent phases and is not yet implemented.)*
 
 ---
 
@@ -57,7 +58,7 @@ The generator (`include/dataset_generator.hpp`, `src/dataset_generator.cpp`) pro
 
 > [!NOTE]
 > **Important Distinction on Workload Scope:**  
-> The `Balanced` and `Skewed` profiles govern strictly the distribution and sizes of **ground-truth duplicate groups**. They do **not** dictate the downstream SimHash candidate bucket distribution. The actual bucket workloads and pairwise candidate comparison counts are explicitly measured by Phase 3's workload statistics.
+> The `Balanced` and `Skewed` profiles govern strictly the distribution and sizes of **ground-truth duplicate groups**. They do **not** dictate the downstream SimHash candidate bucket distribution. The actual bucket workloads and pairwise candidate comparison counts are explicitly measured by Phase 3's and Phase 4's workload statistics.
 
 ---
 
@@ -95,9 +96,9 @@ The SimHash module (`include/simhash.hpp`, `src/simhash.cpp`) transforms variabl
 
 ---
 
-## Sequential Candidate Generation & Verification (Phase 3)
+## Candidate Generation, Verification & Workload Statistics (Phase 3)
 
-The candidate-generation and verification pipeline (`include/candidate_gen.hpp`, `src/candidate_gen.cpp`) provides a deterministic, single-threaded baseline that prunes comparisons using fingerprint banding and verifies candidate pairs against an exact Hamming-distance threshold.
+The candidate-generation and verification pipeline (`include/candidate_gen.hpp`, `src/candidate_gen.cpp`) provides a deterministic, single-threaded reference baseline that prunes comparisons using fingerprint banding and verifies candidate pairs against an exact Hamming-distance threshold.
 
 ### 1. 8-Band, 8-Bit Fingerprint Partitioning
 - Each 64-bit fingerprint is partitioned into **8 non-overlapping bands of 8 bits each**:
@@ -137,13 +138,48 @@ To support subsequent OpenMP scheduling analysis, the pipeline records:
 - **Mean Estimated Pair Work:** Mean of $W_i$ across buckets with $k_i \ge 2$.
 - **Coefficient of Variation (CV):** $\text{CV} = \frac{\sigma}{\mu}$, where $\sigma$ is the population standard deviation of $W_i$ and $\mu$ is the mean of $W_i$ across buckets with $k_i \ge 2$. If no buckets have $k_i \ge 2$, $\text{CV} = 0.0$.
 
-### 6. Stage Timings
-Stage runtimes are measured in milliseconds using `std::chrono::high_resolution_clock`:
-1. **Fingerprinting:** SimHash calculation across all documents.
-2. **Bucket Construction:** Band extraction and bucket assignment.
-3. **Candidate Gen & Deduplication:** Pair expansion within buckets and unique sorting.
-4. **Hamming Distance Verification:** Pairwise XOR population count on candidate pairs.
-5. **Total Pipeline Runtime:** End-to-end wall-clock time.
+---
+
+## OpenMP Parallelization & Scheduling Baselines (Phase 4)
+
+The OpenMP parallel pipeline (`include/parallel_pipeline.hpp`, `src/parallel_pipeline.cpp`) extends candidate detection across multicore CPU threads using standard loop-scheduling baselines while guaranteeing bitwise-identical output to the sequential reference implementation.
+
+### 1. Parallel Pipeline Interface
+```cpp
+// include/parallel_pipeline.hpp
+enum class SchedulePolicy { Static, Dynamic, Guided };
+
+struct ParallelConfig {
+    PipelineConfig base_config{};                           // Shingle size & Hamming threshold
+    int thread_count{4};                                    // OpenMP thread count (> 0)
+    SchedulePolicy schedule_policy{SchedulePolicy::Static}; // Static, Dynamic, or Guided
+    int chunk_size{0};                                      // Chunk size (0 = OpenMP default)
+
+    void validate() const;
+};
+
+PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
+                                     const ParallelConfig& config = ParallelConfig{});
+```
+
+### 2. Parallelized vs. Sequential Stages
+- **Fingerprinting (Parallel):** Preallocated vector storage `result.fingerprints[num_docs]`. Each OpenMP thread computes SimHash for its assigned document partition and writes directly to its disjoint output index without synchronization locks.
+- **Bucket Construction & Workload Statistics (Sequential):** Kept sequential. Since there are only $8 \times 256 = 2048$ bucket slots, sequential table grouping runs in $< 0.2$ ms and completely avoids hash table lock contention or atomic insertion overhead.
+- **Candidate Generation (Parallel):** Parallel loop iterates over active buckets ($k_i \ge 2$). To avoid critical section contention, each thread accumulates candidate pairs into thread-local storage (`tl_candidates[tid]`). After the parallel region, thread-local vectors are merged, sorted lexicographically, and deduplicated via `std::unique`.
+- **Hamming-Distance Verification (Parallel):** Parallel loop distributes deduplicated candidate pairs across threads. Matching pairs are recorded in thread-local storage (`tl_verified[tid]`), merged, and sorted lexicographically after the parallel region.
+
+### 3. OpenMP Scheduling Policies Supported
+- **`Static` Scheduling:** Work iterations divided evenly into contiguous chunks across threads before execution. Minimizes scheduling overhead, but sensitive to load imbalance under skewed bucket workloads.
+- **`Dynamic` Scheduling:** Work divided into chunks of size `chunk_size` and assigned to idle threads dynamically from a shared work queue. Mitigates load imbalance at the cost of runtime synchronization.
+- **`Guided` Scheduling:** Chunks start large and decrease exponentially down to `chunk_size`, balancing runtime synchronization overhead with dynamic load balancing.
+- **RAII Schedule Safety:** An RAII guard (`OmpScheduleGuard`) sets `omp_set_schedule()` during execution and restores prior runtime settings upon exit, preventing scheduler state leaks.
+
+### 4. Deterministic Output Guarantee
+Because thread-local accumulation orders depend on dynamic thread scheduling, both candidate pairs and verified pairs are sorted lexicographically (`std::sort`) after parallel accumulation. **As a result, parallel execution produces bitwise-identical fingerprints, candidate pairs, verified pairs, and workload statistics to the sequential reference implementation across all thread counts and scheduling policies.**
+
+> [!NOTE]
+> **Performance Note on Small Workloads:**  
+> Parallel speedup is not guaranteed for small document collections ($N < 500$) due to thread creation and synchronization overhead. Measurable speedup becomes evident on larger corpuses or computationally heavy verification stages.
 
 ---
 
@@ -194,6 +230,7 @@ ctest --test-dir build --output-on-failure
 .\build\test_dataset_generator.exe
 .\build\test_simhash.exe
 .\build\test_candidate_gen.exe
+.\build\test_parallel_pipeline.exe
 ```
 
 ### 5. Run the Demonstration Program
@@ -226,14 +263,14 @@ ctest --test-dir build --output-on-failure
 ---------------------------------------------------------
  Synthetic Dataset Summary
 ---------------------------------------------------------
-  Total Documents          : 100
-  Original Documents       : 50
-  Exact Copies             : 20
-  Modified Copies          : 20
-  Unrelated Singletons     : 10
-  Total Ground-Truth Groups: 60
-  Duplicate Groups (size>1): 40
-  Max Group Size           : 2
+  Total Documents          : 200
+  Original Documents       : 80
+  Exact Copies             : 50
+  Modified Copies          : 50
+  Unrelated Singletons     : 20
+  Total Ground-Truth Groups: 100
+  Duplicate Groups (size>1): 80
+  Max Group Size           : 3
   Min Group Size           : 1
   Workload Profile         : Balanced
   Random Seed              : 42
@@ -248,44 +285,36 @@ Fingerprinting sample documents from generated dataset:
   1 |     2 | Original      | 0x21a8e5b0e0217776 | lock topology overhead partition operation...
   2 |     3 | Original      | 0x4127038eff417d0b | scheduling dynamic compiler static memory...
   3 |     4 | Original      | 0x7ee5533a1895b04e | size array reproducibility cache deterministic...
-  4 |     5 | Original      | 0xfdf306ccb767d2d5 | fault cache performance operating decomposition...
-  5 |     6 | Original      | 0xac04ab3984a7c422 | random flow decomposition efficiency instruction...
 ----------------------------------------------------------------------------------
 
-[Phase 3 Demonstration: Sequential Pipeline Execution]
-Pipeline Summary:
-  Input Documents Processed : 100
-  Total Candidate Pairs     : 179
-  Verified Near-Duplicate Pairs : 20
+[Phase 3 & 4 Demonstration: Sequential vs. OpenMP Parallel Baselines]
 
+>>> Running Sequential Reference Pipeline...
+  Candidate Pairs Generated : 702
+  Verified Near-Duplicates  : 50
+  Sequential Total Runtime  : 2.558 ms
+
+>>> Running OpenMP Parallel Pipelines (4 threads)...
+--------------------------------------------------------------------------------------------
+ Schedule Policy | Chunk | Fingerprint | Candidate Gen | Verification | Total Time | Parity 
+--------------------------------------------------------------------------------------------
+ Static          | 0     |     1.053 ms |       0.269 ms |      0.083 ms |    1.571 ms | EXACT MATCH
+ Dynamic         | 2     |     0.751 ms |       0.172 ms |      0.115 ms |    1.203 ms | EXACT MATCH
+ Guided          | 2     |     0.803 ms |       0.210 ms |      0.115 ms |    1.270 ms | EXACT MATCH
+--------------------------------------------------------------------------------------------
+
+Workload Statistics (Identical across Sequential and Parallel):
 ---------------------------------------------------------
  SimHash Bucket Workload Statistics (8 bands x 8 bits)
 ---------------------------------------------------------
-  Occupied Buckets (k >= 1)         : 547
-  Buckets with Pair Work (k >= 2)   : 202
-  Max Bucket Size                   : 6
-  Mean Bucket Size (Occupied)       : 1.46
-  Max Estimated Bucket Pair Work    : 15
-  Mean Estimated Pair Work (k >= 2) : 1.59
-  Coefficient of Variation (CV)     : 1.02
+  Occupied Buckets (k >= 1)         : 893
+  Buckets with Pair Work (k >= 2)   : 464
+  Max Bucket Size                   : 7
+  Mean Bucket Size (Occupied)       : 1.79
+  Max Estimated Bucket Pair Work    : 21
+  Mean Estimated Pair Work (k >= 2) : 2.33
+  Coefficient of Variation (CV)     : 1.18
 ---------------------------------------------------------
----------------------------------------------------------
- Sequential Pipeline Stage Timings
----------------------------------------------------------
-  1. Fingerprinting                 : 1.349 ms
-  2. Bucket Construction            : 0.133 ms
-  3. Candidate Gen & Deduplication  : 0.028 ms
-  4. Hamming Distance Verification  : 0.005 ms
-  -------------------------------------------------------
-  Total Pipeline Runtime            : 1.516 ms
----------------------------------------------------------
-
-Sample Verified Near-Duplicates (Threshold <= 3):
-  Pair (Doc 0, Doc 50) -> Hamming Distance: 0 bits
-  Pair (Doc 1, Doc 51) -> Hamming Distance: 0 bits
-  Pair (Doc 2, Doc 52) -> Hamming Distance: 0 bits
-  Pair (Doc 3, Doc 53) -> Hamming Distance: 0 bits
-  Pair (Doc 4, Doc 54) -> Hamming Distance: 0 bits
 
 [Status] Execution completed successfully.
 ```

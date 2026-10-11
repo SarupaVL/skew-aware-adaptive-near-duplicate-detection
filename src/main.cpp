@@ -1,12 +1,13 @@
 #include "candidate_gen.hpp"
 #include "dataset_generator.hpp"
+#include "parallel_pipeline.hpp"
 #include "simhash.hpp"
+
 #include <iomanip>
 #include <iostream>
 #include <omp.h>
 
 // Returns a human-readable description of the C++ standard
-// based on the standard __cplusplus preprocessor macro.
 const char* get_cpp_standard_name(long standard_value) {
     if (standard_value >= 202002L) {
         return "C++20 or later";
@@ -53,19 +54,19 @@ int main() {
     // -------------------------------------------------------------
     std::cout << "[Phase 1 Demonstration: Dataset Generation]\n";
 
-    DatasetConfig balanced_cfg;
-    balanced_cfg.total_documents = 100;
-    balanced_cfg.min_words = 30;
-    balanced_cfg.max_words = 60;
-    balanced_cfg.exact_duplicate_ratio = 0.20;
-    balanced_cfg.modified_copy_ratio = 0.20;
-    balanced_cfg.unrelated_ratio = 0.10;
-    balanced_cfg.modification_rate = 0.10;
-    balanced_cfg.random_seed = 42;
-    balanced_cfg.profile = WorkloadProfile::Balanced;
+    DatasetConfig dcfg;
+    dcfg.total_documents = 200;
+    dcfg.min_words = 30;
+    dcfg.max_words = 60;
+    dcfg.exact_duplicate_ratio = 0.25;
+    dcfg.modified_copy_ratio = 0.25;
+    dcfg.unrelated_ratio = 0.10;
+    dcfg.modification_rate = 0.10;
+    dcfg.random_seed = 42;
+    dcfg.profile = WorkloadProfile::Balanced;
 
-    std::vector<Document> dataset = generate_dataset(balanced_cfg);
-    DatasetSummary summary = summarize_dataset(dataset, balanced_cfg);
+    std::vector<Document> dataset = generate_dataset(dcfg);
+    DatasetSummary summary = summarize_dataset(dataset, dcfg);
     summary.print(std::cout);
 
     // -------------------------------------------------------------
@@ -77,7 +78,7 @@ int main() {
     std::cout << " ID | Group | Kind          | 64-bit Hex Fingerprint | First 5 Words\n";
     std::cout << "----------------------------------------------------------------------------------\n";
 
-    size_t preview_count = std::min<size_t>(dataset.size(), 6);
+    size_t preview_count = std::min<size_t>(dataset.size(), 4);
     for (size_t i = 0; i < preview_count; ++i) {
         const auto& doc = dataset[i];
         uint64_t fp = compute_simhash(doc.text);
@@ -100,31 +101,65 @@ int main() {
     std::cout << "----------------------------------------------------------------------------------\n\n";
 
     // -------------------------------------------------------------
-    // Phase 3 Demonstration: Sequential Candidate Gen & Verification
+    // Phase 3 & 4: Sequential vs. OpenMP Parallel Scheduling Baselines
     // -------------------------------------------------------------
-    std::cout << "[Phase 3 Demonstration: Sequential Pipeline Execution]\n";
+    std::cout << "[Phase 3 & 4 Demonstration: Sequential vs. OpenMP Parallel Baselines]\n";
 
     PipelineConfig pipe_cfg;
     pipe_cfg.shingle_size = 3;
     pipe_cfg.max_hamming_threshold = 3;
 
-    PipelineResult pipe_result = run_sequential_pipeline(dataset, pipe_cfg);
+    // 1. Sequential Reference Run
+    std::cout << "\n>>> Running Sequential Reference Pipeline...\n";
+    PipelineResult seq_res = run_sequential_pipeline(dataset, pipe_cfg);
 
-    std::cout << "Pipeline Summary:\n";
-    std::cout << "  Input Documents Processed : " << pipe_result.document_ids.size() << "\n";
-    std::cout << "  Total Candidate Pairs     : " << pipe_result.candidate_pairs.size() << "\n";
-    std::cout << "  Verified Near-Duplicate Pairs : " << pipe_result.verified_pairs.size() << "\n\n";
+    std::cout << "  Candidate Pairs Generated : " << seq_res.candidate_pairs.size() << "\n";
+    std::cout << "  Verified Near-Duplicates  : " << seq_res.verified_pairs.size() << "\n";
+    std::cout << "  Sequential Total Runtime  : " << std::fixed << std::setprecision(3)
+              << seq_res.timings.total_pipeline_ms << " ms\n";
 
-    pipe_result.workload_stats.print(std::cout);
-    pipe_result.timings.print(std::cout);
+    // 2. Parallel Baseline Runs: Static, Dynamic, and Guided Scheduling
+    int demo_threads = std::min(4, omp_get_max_threads());
+    std::cout << "\n>>> Running OpenMP Parallel Pipelines (" << demo_threads << " threads)...\n";
 
-    std::cout << "\nSample Verified Near-Duplicates (Threshold <= " << pipe_cfg.max_hamming_threshold << "):\n";
-    size_t sample_show = std::min<size_t>(pipe_result.verified_pairs.size(), 5);
-    for (size_t i = 0; i < sample_show; ++i) {
-        const auto& vp = pipe_result.verified_pairs[i];
-        std::cout << "  Pair (Doc " << vp.first << ", Doc " << vp.second
-                  << ") -> Hamming Distance: " << vp.distance << " bits\n";
+    std::vector<SchedulePolicy> demo_policies = {
+        SchedulePolicy::Static,
+        SchedulePolicy::Dynamic,
+        SchedulePolicy::Guided
+    };
+
+    std::cout << "--------------------------------------------------------------------------------------------\n";
+    std::cout << " Schedule Policy | Chunk | Fingerprint | Candidate Gen | Verification | Total Time | Parity \n";
+    std::cout << "--------------------------------------------------------------------------------------------\n";
+
+    for (auto policy : demo_policies) {
+        ParallelConfig par_cfg;
+        par_cfg.base_config = pipe_cfg;
+        par_cfg.thread_count = demo_threads;
+        par_cfg.schedule_policy = policy;
+        par_cfg.chunk_size = (policy == SchedulePolicy::Static) ? 0 : 2;
+
+        PipelineResult par_res = run_parallel_pipeline(dataset, par_cfg);
+
+        // Verify exact equivalence of outputs with sequential baseline
+        bool parity_ok = (seq_res.document_ids == par_res.document_ids) &&
+                         (seq_res.fingerprints == par_res.fingerprints) &&
+                         (seq_res.candidate_pairs == par_res.candidate_pairs) &&
+                         (seq_res.verified_pairs == par_res.verified_pairs);
+
+        std::cout << " " << std::setw(15) << std::left << to_string(policy)
+                  << " | " << std::setw(5) << par_cfg.chunk_size
+                  << " | " << std::setw(9) << std::right << par_res.timings.fingerprinting_ms << " ms"
+                  << " | " << std::setw(11) << par_res.timings.candidate_generation_dedup_ms << " ms"
+                  << " | " << std::setw(10) << par_res.timings.verification_ms << " ms"
+                  << " | " << std::setw(8) << par_res.timings.total_pipeline_ms << " ms"
+                  << " | " << (parity_ok ? "EXACT MATCH" : "MISMATCH!")
+                  << "\n";
     }
+    std::cout << "--------------------------------------------------------------------------------------------\n";
+
+    std::cout << "\nWorkload Statistics (Identical across Sequential and Parallel):\n";
+    seq_res.workload_stats.print(std::cout);
 
     std::cout << "\n[Status] Execution completed successfully.\n";
     return 0;
