@@ -1,3 +1,4 @@
+#include "candidate_gen.hpp"
 #include "dataset_generator.hpp"
 #include "simhash.hpp"
 #include <iomanip>
@@ -53,13 +54,13 @@ int main() {
     std::cout << "[Phase 1 Demonstration: Dataset Generation]\n";
 
     DatasetConfig balanced_cfg;
-    balanced_cfg.total_documents = 20;
-    balanced_cfg.min_words = 25;
-    balanced_cfg.max_words = 50;
+    balanced_cfg.total_documents = 100;
+    balanced_cfg.min_words = 30;
+    balanced_cfg.max_words = 60;
     balanced_cfg.exact_duplicate_ratio = 0.20;
     balanced_cfg.modified_copy_ratio = 0.20;
     balanced_cfg.unrelated_ratio = 0.10;
-    balanced_cfg.modification_rate = 0.15;
+    balanced_cfg.modification_rate = 0.10;
     balanced_cfg.random_seed = 42;
     balanced_cfg.profile = WorkloadProfile::Balanced;
 
@@ -68,7 +69,7 @@ int main() {
     summary.print(std::cout);
 
     // -------------------------------------------------------------
-    // Phase 2 Demonstration: SimHash Fingerprinting & Hamming Distance
+    // Phase 2 Demonstration: SimHash Fingerprints Preview
     // -------------------------------------------------------------
     std::cout << "\n[Phase 2 Demonstration: SimHash Fingerprints]\n";
     std::cout << "Fingerprinting sample documents from generated dataset:\n";
@@ -76,17 +77,11 @@ int main() {
     std::cout << " ID | Group | Kind          | 64-bit Hex Fingerprint | First 5 Words\n";
     std::cout << "----------------------------------------------------------------------------------\n";
 
-    // Fingerprint first 8 documents as a simple demonstration
-    size_t demo_count = std::min<size_t>(dataset.size(), 8);
-    std::vector<uint64_t> sample_fingerprints;
-    sample_fingerprints.reserve(demo_count);
-
-    for (size_t i = 0; i < demo_count; ++i) {
+    size_t preview_count = std::min<size_t>(dataset.size(), 6);
+    for (size_t i = 0; i < preview_count; ++i) {
         const auto& doc = dataset[i];
         uint64_t fp = compute_simhash(doc.text);
-        sample_fingerprints.push_back(fp);
 
-        // Extract first 5 words for preview
         auto tokens = tokenize_text(doc.text);
         std::string preview;
         for (size_t t = 0; t < std::min<size_t>(tokens.size(), 5); ++t) {
@@ -102,17 +97,33 @@ int main() {
                   << std::dec << std::setfill(' ') << " | "
                   << preview << "\n";
     }
-    std::cout << "----------------------------------------------------------------------------------\n";
+    std::cout << "----------------------------------------------------------------------------------\n\n";
 
-    // Show a sample pairwise Hamming distance check between document 0 and an exact copy if present
-    for (size_t i = 1; i < demo_count; ++i) {
-        if (dataset[i].source_id == static_cast<int64_t>(dataset[0].id)) {
-            int dist = hamming_distance(sample_fingerprints[0], sample_fingerprints[i]);
-            std::cout << "\nSample Hamming distance between Document 0 (Original) and Document "
-                      << dataset[i].id << " (" << to_string(dataset[i].kind) << "): "
-                      << dist << " bits differing\n";
-            break;
-        }
+    // -------------------------------------------------------------
+    // Phase 3 Demonstration: Sequential Candidate Gen & Verification
+    // -------------------------------------------------------------
+    std::cout << "[Phase 3 Demonstration: Sequential Pipeline Execution]\n";
+
+    PipelineConfig pipe_cfg;
+    pipe_cfg.shingle_size = 3;
+    pipe_cfg.max_hamming_threshold = 3;
+
+    PipelineResult pipe_result = run_sequential_pipeline(dataset, pipe_cfg);
+
+    std::cout << "Pipeline Summary:\n";
+    std::cout << "  Input Documents Processed : " << pipe_result.document_ids.size() << "\n";
+    std::cout << "  Total Candidate Pairs     : " << pipe_result.candidate_pairs.size() << "\n";
+    std::cout << "  Verified Near-Duplicate Pairs : " << pipe_result.verified_pairs.size() << "\n\n";
+
+    pipe_result.workload_stats.print(std::cout);
+    pipe_result.timings.print(std::cout);
+
+    std::cout << "\nSample Verified Near-Duplicates (Threshold <= " << pipe_cfg.max_hamming_threshold << "):\n";
+    size_t sample_show = std::min<size_t>(pipe_result.verified_pairs.size(), 5);
+    for (size_t i = 0; i < sample_show; ++i) {
+        const auto& vp = pipe_result.verified_pairs[i];
+        std::cout << "  Pair (Doc " << vp.first << ", Doc " << vp.second
+                  << ") -> Hamming Distance: " << vp.distance << " bits\n";
     }
 
     std::cout << "\n[Status] Execution completed successfully.\n";

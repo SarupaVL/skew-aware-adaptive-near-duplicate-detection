@@ -6,14 +6,15 @@ This project investigates CPU-based near-duplicate document detection using SimH
 
 ---
 
-## Current Status: Phase 2 Completed
+## Current Status: Phase 3 Completed
 
 The project has completed:
 - **Phase 0:** Environment inspection, C++17 validation, and OpenMP runtime verification.
 - **Phase 1:** In-memory document data model, ground-truth duplicate cluster semantics, and deterministic synthetic dataset generator.
 - **Phase 2:** 64-bit SimHash locality-sensitive fingerprinting, deterministic FNV-1a hashing, token shingling, and bitwise Hamming distance computation.
+- **Phase 3:** Deterministic sequential near-duplicate detection pipeline: 8-band / 8-bit candidate generation, pair deduplication, Hamming-distance verification, bucket workload statistics, and stage timings.
 
-*(Subsequent components—candidate band indexing, duplicate pair verification, and OpenMP parallel loop schedulers—are part of future phases and are not yet implemented.)*
+*(Parallel execution—OpenMP static, dynamic, guided, and adaptive scheduling—is part of subsequent phases and is not yet implemented. The pipeline at this stage is strictly sequential to establish the correctness baseline.)*
 
 ---
 
@@ -56,7 +57,7 @@ The generator (`include/dataset_generator.hpp`, `src/dataset_generator.cpp`) pro
 
 > [!NOTE]
 > **Important Distinction on Workload Scope:**  
-> In Phase 1 and 2, the `Balanced` and `Skewed` profiles govern strictly the distribution and sizes of **ground-truth duplicate groups**. They do **not** dictate the downstream SimHash candidate bucket distribution. The actual bucket workloads and pairwise candidate comparison counts will be experimentally measured once candidate band generation is implemented in Phase 3.
+> The `Balanced` and `Skewed` profiles govern strictly the distribution and sizes of **ground-truth duplicate groups**. They do **not** dictate the downstream SimHash candidate bucket distribution. The actual bucket workloads and pairwise candidate comparison counts are explicitly measured by Phase 3's workload statistics.
 
 ---
 
@@ -91,6 +92,58 @@ The SimHash module (`include/simhash.hpp`, `src/simhash.cpp`) transforms variabl
 - `hamming_distance(a, b)` computes the number of differing bit positions between two 64-bit fingerprints using bitwise XOR and hardware population count:
   $$\text{dist}(a, b) = \text{popcount}(a \oplus b)$$
 - Output ranges from `0` (identical) to `64` (completely inverted).
+
+---
+
+## Sequential Candidate Generation & Verification (Phase 3)
+
+The candidate-generation and verification pipeline (`include/candidate_gen.hpp`, `src/candidate_gen.cpp`) provides a deterministic, single-threaded baseline that prunes comparisons using fingerprint banding and verifies candidate pairs against an exact Hamming-distance threshold.
+
+### 1. 8-Band, 8-Bit Fingerprint Partitioning
+- Each 64-bit fingerprint is partitioned into **8 non-overlapping bands of 8 bits each**:
+  - Band 0: bits 0..7
+  - Band 1: bits 8..15
+  - ...
+  - Band 7: bits 56..63
+- A candidate bucket is uniquely keyed by **`(band_index, band_value)`** where `band_index` $\in [0, 7]$ and `band_value` $\in [0, 255]$ (256 buckets per band; 2048 total possible buckets across all bands).
+- Two documents are mapped into the same bucket if and only if they share the exact same 8-bit value at that specific band index. Identical 8-bit values occurring in different band indices are strictly separate buckets.
+
+### 2. Candidate Pair Generation & Deduplication
+- Within each bucket containing $k \ge 2$ documents, all unordered pairs $(u, v)$ are generated.
+- Each pair is normalized such that the smaller document ID comes first ($u < v$).
+- Because near-duplicate documents often match across multiple bands, candidate pairs are collected across all bands, sorted lexicographically, and deduplicated.
+- **Deterministic ordering:** Deduplicated pairs are sorted so that candidate output is bitwise reproducible.
+
+### 3. Exact Hamming-Distance Verification
+- Every unique candidate pair $(u, v)$ is verified by computing $\text{dist}(\text{fp}_u, \text{fp}_v)$.
+- A candidate pair is retained as a detected near-duplicate if:
+  $$\text{dist}(\text{fp}_u, \text{fp}_v) \le \text{max\_hamming\_threshold}$$
+- **Configurable threshold:** Default is **3 bits** (`kDefaultHammingThreshold = 3`).
+- Candidate pairs exceeding the threshold are discarded as false positives.
+
+### 4. Essential Correctness Guarantee (Recall Guarantee for Distance $\le 7$)
+> **Mathematical Property (Pigeonhole Principle):**  
+> With 8 bands of 8 bits across 64 bits, any two fingerprints differing by at most 7 bits ($\text{dist} \le 7$) must contain at least one band with 0 differing bits.  
+> Consequently, **every document pair with Hamming distance $\le 7$ is guaranteed to share at least one identical band and appear in the candidate set (100% candidate recall).**
+
+This property is verified by an automated test comparing pipeline candidates against exhaustive all-pairs ($O(N^2)$) checks. For any threshold $\le 7$ (including the default threshold of 3), the candidate-verification pipeline produces the exact same near-duplicate pairs as exhaustive all-pairs verification.
+
+### 5. Workload Statistics Definitions
+To support subsequent OpenMP scheduling analysis, the pipeline records:
+- **Occupied Buckets:** Count of buckets containing $k_i \ge 1$ documents across all 8 bands.
+- **Buckets with Pair Work:** Count of buckets containing $k_i \ge 2$ documents.
+- **Estimated Pair Work ($W_i$):** $W_i = \frac{k_i(k_i - 1)}{2}$ pairwise comparisons for bucket $i$.
+- **Mean Bucket Size:** $\frac{\sum k_i}{\text{Occupied Buckets}}$.
+- **Mean Estimated Pair Work:** Mean of $W_i$ across buckets with $k_i \ge 2$.
+- **Coefficient of Variation (CV):** $\text{CV} = \frac{\sigma}{\mu}$, where $\sigma$ is the population standard deviation of $W_i$ and $\mu$ is the mean of $W_i$ across buckets with $k_i \ge 2$. If no buckets have $k_i \ge 2$, $\text{CV} = 0.0$.
+
+### 6. Stage Timings
+Stage runtimes are measured in milliseconds using `std::chrono::high_resolution_clock`:
+1. **Fingerprinting:** SimHash calculation across all documents.
+2. **Bucket Construction:** Band extraction and bucket assignment.
+3. **Candidate Gen & Deduplication:** Pair expansion within buckets and unique sorting.
+4. **Hamming Distance Verification:** Pairwise XOR population count on candidate pairs.
+5. **Total Pipeline Runtime:** End-to-end wall-clock time.
 
 ---
 
@@ -134,12 +187,13 @@ cmake --build build-release
 
 ### 4. Run Automated Tests
 ```powershell
-# Run via CTest
+# Run all tests via CTest
 ctest --test-dir build --output-on-failure
 
 # Or run individual test suites directly
 .\build\test_dataset_generator.exe
 .\build\test_simhash.exe
+.\build\test_candidate_gen.exe
 ```
 
 ### 5. Run the Demonstration Program
@@ -172,13 +226,13 @@ ctest --test-dir build --output-on-failure
 ---------------------------------------------------------
  Synthetic Dataset Summary
 ---------------------------------------------------------
-  Total Documents          : 20
-  Original Documents       : 10
-  Exact Copies             : 4
-  Modified Copies          : 4
-  Unrelated Singletons     : 2
-  Total Ground-Truth Groups: 12
-  Duplicate Groups (size>1): 8
+  Total Documents          : 100
+  Original Documents       : 50
+  Exact Copies             : 20
+  Modified Copies          : 20
+  Unrelated Singletons     : 10
+  Total Ground-Truth Groups: 60
+  Duplicate Groups (size>1): 40
   Max Group Size           : 2
   Min Group Size           : 1
   Workload Profile         : Balanced
@@ -190,17 +244,48 @@ Fingerprinting sample documents from generated dataset:
 ----------------------------------------------------------------------------------
  ID | Group | Kind          | 64-bit Hex Fingerprint | First 5 Words
 ----------------------------------------------------------------------------------
-  0 |     1 | Original      | 0xda1259ecf93661af | pipeline resource cost strategy compiler...
-  1 |     2 | Original      | 0x31b02534f0417760 | metric iteration pool library locality...
-  2 |     3 | Original      | 0xa12f079bef003d1a | overhead multithreaded parallel buffer integer...
-  3 |     4 | Original      | 0x7cf573ba9985b85a | load capacity speedup segment strategy...
-  4 |     5 | Original      | 0x8fe3078803e5b1a5 | pipeline buffer multicore index response...
-  5 |     6 | Original      | 0xfcb106c6bb73dad4 | deterministic database deadlock database contention...
-  6 |     7 | Original      | 0xbe0eaf93a427e173 | library performance structure random flow...
-  7 |     8 | Original      | 0xc624cb293bb30460 | random data timer computation data...
+  0 |     1 | Original      | 0xda965b2df926c1ef | pipeline resource cost strategy compiler...
+  1 |     2 | Original      | 0x21a8e5b0e0217776 | lock topology overhead partition operation...
+  2 |     3 | Original      | 0x4127038eff417d0b | scheduling dynamic compiler static memory...
+  3 |     4 | Original      | 0x7ee5533a1895b04e | size array reproducibility cache deterministic...
+  4 |     5 | Original      | 0xfdf306ccb767d2d5 | fault cache performance operating decomposition...
+  5 |     6 | Original      | 0xac04ab3984a7c422 | random flow decomposition efficiency instruction...
 ----------------------------------------------------------------------------------
 
-Sample Hamming distance between Document 0 (Original) and Document 10 (ExactCopy): 0 bits differing
+[Phase 3 Demonstration: Sequential Pipeline Execution]
+Pipeline Summary:
+  Input Documents Processed : 100
+  Total Candidate Pairs     : 179
+  Verified Near-Duplicate Pairs : 20
+
+---------------------------------------------------------
+ SimHash Bucket Workload Statistics (8 bands x 8 bits)
+---------------------------------------------------------
+  Occupied Buckets (k >= 1)         : 547
+  Buckets with Pair Work (k >= 2)   : 202
+  Max Bucket Size                   : 6
+  Mean Bucket Size (Occupied)       : 1.46
+  Max Estimated Bucket Pair Work    : 15
+  Mean Estimated Pair Work (k >= 2) : 1.59
+  Coefficient of Variation (CV)     : 1.02
+---------------------------------------------------------
+---------------------------------------------------------
+ Sequential Pipeline Stage Timings
+---------------------------------------------------------
+  1. Fingerprinting                 : 1.349 ms
+  2. Bucket Construction            : 0.133 ms
+  3. Candidate Gen & Deduplication  : 0.028 ms
+  4. Hamming Distance Verification  : 0.005 ms
+  -------------------------------------------------------
+  Total Pipeline Runtime            : 1.516 ms
+---------------------------------------------------------
+
+Sample Verified Near-Duplicates (Threshold <= 3):
+  Pair (Doc 0, Doc 50) -> Hamming Distance: 0 bits
+  Pair (Doc 1, Doc 51) -> Hamming Distance: 0 bits
+  Pair (Doc 2, Doc 52) -> Hamming Distance: 0 bits
+  Pair (Doc 3, Doc 53) -> Hamming Distance: 0 bits
+  Pair (Doc 4, Doc 54) -> Hamming Distance: 0 bits
 
 [Status] Execution completed successfully.
 ```
