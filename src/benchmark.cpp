@@ -262,6 +262,36 @@ ParityCheckResult verify_pipeline_parity(
         return res;
     }
 
+    // 7. Evaluated, emitted, and suppressed pair counter consistency (Phase 10)
+    if (candidate_res.raw_candidates_evaluated != expected_total_pair_work) {
+        res.passed = false;
+        res.failure_reason = "raw_candidates_evaluated (" +
+            std::to_string(candidate_res.raw_candidates_evaluated) +
+            ") does not equal total bucket pair work (" +
+            std::to_string(expected_total_pair_work) + ").";
+        return res;
+    }
+    if (candidate_res.raw_candidates_emitted + candidate_res.suppressed_pair_count !=
+        candidate_res.raw_candidates_evaluated) {
+        res.passed = false;
+        res.failure_reason = "raw_candidates_emitted + suppressed_pair_count does not equal raw_candidates_evaluated.";
+        return res;
+    }
+    if (!candidate_res.band_suppression_enabled && candidate_res.suppressed_pair_count != 0) {
+        res.passed = false;
+        res.failure_reason = "suppressed_pair_count must be 0 when band_suppression_enabled is false.";
+        return res;
+    }
+    if (candidate_res.band_suppression_enabled &&
+        candidate_res.raw_candidates_emitted != candidate_res.candidate_pairs.size()) {
+        res.passed = false;
+        res.failure_reason = "When band_suppression_enabled is true, raw_candidates_emitted (" +
+            std::to_string(candidate_res.raw_candidates_emitted) +
+            ") must equal unique candidate_pairs.size() (" +
+            std::to_string(candidate_res.candidate_pairs.size()) + ").";
+        return res;
+    }
+
     return res;
 }
 
@@ -418,6 +448,11 @@ BenchmarkSummaryRow summarize_benchmark_samples(
         );
     }
 
+    summary.band_suppression_enabled = first.band_suppression_enabled;
+    summary.raw_candidates_evaluated = first.raw_candidates_evaluated;
+    summary.raw_candidates_emitted = first.raw_candidates_emitted;
+    summary.suppressed_pair_count = first.suppressed_pair_count;
+
     return summary;
 }
 
@@ -549,6 +584,11 @@ BenchmarkSampleRow build_sample_row(
     row.total_units_processed = wb.total_units_processed;
     row.per_thread_work_distribution = wb.per_thread_work_distribution;
 
+    row.band_suppression_enabled = res.band_suppression_enabled;
+    row.raw_candidates_evaluated = res.raw_candidates_evaluated;
+    row.raw_candidates_emitted = res.raw_candidates_emitted;
+    row.suppressed_pair_count = res.suppressed_pair_count;
+
     return row;
 }
 
@@ -618,13 +658,57 @@ std::vector<BenchmarkConfigSpec> generate_shuffled_config_order(
     return shuffled;
 }
 
+std::vector<BenchmarkConfigSpec> generate_paired_config_order(
+    const std::vector<BenchmarkConfigSpec>& base_specs,
+    uint64_t order_seed,
+    size_t dataset_size,
+    WorkloadProfile profile,
+    size_t round_index
+) {
+    const std::vector<BenchmarkConfigSpec> shuffled_configs =
+        generate_shuffled_config_order(base_specs, order_seed, dataset_size, profile, round_index);
+
+    std::vector<BenchmarkConfigSpec> paired;
+    paired.reserve(shuffled_configs.size() * 2);
+
+    for (size_t k = 0; k < shuffled_configs.size(); ++k) {
+        BenchmarkConfigSpec base_variant = shuffled_configs[k];
+        base_variant.enable_band_suppression = false;
+
+        BenchmarkConfigSpec supp_variant = shuffled_configs[k];
+        supp_variant.enable_band_suppression = true;
+
+        // Alternate which variant executes first across rounds and positions
+        if (((round_index + k) & 1ULL) == 0ULL) {
+            paired.push_back(base_variant);
+            paired.push_back(supp_variant);
+        } else {
+            paired.push_back(supp_variant);
+            paired.push_back(base_variant);
+        }
+    }
+
+    return paired;
+}
+
 std::string format_config_order(const std::vector<BenchmarkConfigSpec>& specs) {
+    bool has_suppression = false;
+    for (const auto& s : specs) {
+        if (s.enable_band_suppression) {
+            has_suppression = true;
+            break;
+        }
+    }
+
     std::ostringstream oss;
     for (size_t i = 0; i < specs.size(); ++i) {
         if (i > 0) {
             oss << ';';
         }
         oss << to_string(specs[i].policy) << ':' << specs[i].thread_count;
+        if (has_suppression) {
+            oss << ':' << (specs[i].enable_band_suppression ? "Supp" : "Base");
+        }
     }
     return oss.str();
 }
@@ -649,6 +733,27 @@ BenchmarkSuiteResult run_benchmark_suite(
     const std::vector<BenchmarkConfigSpec> base_specs =
         build_dataset_config_specs(suite_cfg.thread_counts);
 
+    const bool paired_mode = suite_cfg.compare_band_suppression;
+    const bool single_suppression_enabled =
+        suite_cfg.enable_band_suppression || suite_cfg.pipeline_config.enable_band_suppression;
+
+    std::vector<BenchmarkConfigSpec> canonical_specs;
+    if (paired_mode) {
+        canonical_specs.reserve(base_specs.size() * 2);
+        for (const auto& bs : base_specs) {
+            canonical_specs.push_back(BenchmarkConfigSpec{bs.policy, bs.thread_count, false});
+            canonical_specs.push_back(BenchmarkConfigSpec{bs.policy, bs.thread_count, true});
+        }
+    } else {
+        canonical_specs = base_specs;
+        for (auto& cs : canonical_specs) {
+            cs.enable_band_suppression = single_suppression_enabled;
+        }
+    }
+
+    PipelineConfig baseline_ref_cfg = suite_cfg.pipeline_config;
+    baseline_ref_cfg.enable_band_suppression = false;
+
     BenchmarkSuiteResult suite_res;
     size_t global_execution_order_index = 0;
 
@@ -670,18 +775,19 @@ BenchmarkSuiteResult run_benchmark_suite(
                              << " Dataset: N=" << dsize
                              << " | Profile=" << to_string(profile)
                              << " | Seed=" << dcfg.random_seed
-                             << " | OrderSeed=" << suite_cfg.order_seed << "\n"
+                             << " | OrderSeed=" << suite_cfg.order_seed
+                             << " | BandSupp=" << (paired_mode ? "PAIRED (Base+Supp)" : (single_suppression_enabled ? "ON" : "OFF")) << "\n"
                              << "===============================================================\n";
             }
 
             // Generate dataset ONCE per (dataset_size, profile, seed) and reuse across all runs
             const std::vector<Document> dataset = generate_dataset(dcfg);
 
-            // Compute the sequential reference result independently BEFORE randomized rounds
-            // so that every warm-up and measured run in any randomized execution order is
-            // verified against an authoritative sequential reference.
+            // Compute the baseline sequential reference result independently BEFORE randomized rounds
+            // so that every warm-up and measured run (including band-suppression runs) is verified
+            // against the unsuppressed Phase 9 baseline sequential reference.
             const PipelineResult reference_seq_result =
-                run_sequential_pipeline(dataset, suite_cfg.pipeline_config);
+                run_sequential_pipeline(dataset, baseline_ref_cfg);
 
             // Helper lambda to run a single BenchmarkConfigSpec on `dataset` and verify parity
             auto run_and_verify_spec = [&](const BenchmarkConfigSpec& spec,
@@ -693,12 +799,16 @@ BenchmarkSuiteResult run_benchmark_suite(
                 out_is_adaptive = false;
                 out_chunk_size = 0;
 
+                PipelineConfig spec_pipeline_cfg = suite_cfg.pipeline_config;
+                spec_pipeline_cfg.enable_band_suppression = spec.enable_band_suppression;
+
                 if (spec.policy == BenchmarkPolicy::Sequential) {
-                    out_res = run_sequential_pipeline(dataset, suite_cfg.pipeline_config);
+                    out_res = run_sequential_pipeline(dataset, spec_pipeline_cfg);
                 } else if (spec.policy == BenchmarkPolicy::Adaptive) {
                     out_is_adaptive = true;
                     AdaptiveConfig acfg;
-                    acfg.base_config = suite_cfg.pipeline_config;
+                    acfg.base_config = spec_pipeline_cfg;
+                    acfg.enable_band_suppression = spec.enable_band_suppression;
                     acfg.thread_count = spec.thread_count;
                     acfg.cv_threshold = suite_cfg.cv_threshold;
                     acfg.oversized_bucket_multiplier = suite_cfg.oversized_bucket_multiplier;
@@ -710,7 +820,8 @@ BenchmarkSuiteResult run_benchmark_suite(
                     out_res = out_adap.pipeline_result;
                 } else {
                     ParallelConfig pcfg;
-                    pcfg.base_config = suite_cfg.pipeline_config;
+                    pcfg.base_config = spec_pipeline_cfg;
+                    pcfg.enable_band_suppression = spec.enable_band_suppression;
                     pcfg.thread_count = spec.thread_count;
                     pcfg.chunk_size = suite_cfg.fixed_chunk_size;
                     out_chunk_size = pcfg.chunk_size;
@@ -730,7 +841,8 @@ BenchmarkSuiteResult run_benchmark_suite(
                     throw std::runtime_error(
                         "Parity failure during " + std::string(to_string(spec.policy)) + " " +
                         phase_label + " (N=" + std::to_string(dsize) + ", T=" +
-                        std::to_string(spec.thread_count) + "): " + parity.failure_reason
+                        std::to_string(spec.thread_count) + ", Supp=" +
+                        std::to_string(spec.enable_band_suppression ? 1 : 0) + "): " + parity.failure_reason
                     );
                 }
                 return parity;
@@ -738,8 +850,9 @@ BenchmarkSuiteResult run_benchmark_suite(
 
             // 1. Interleaved / Randomized Warm-up Rounds (also verified for parity)
             for (size_t w = 0; w < suite_cfg.warmup_runs; ++w) {
-                const std::vector<BenchmarkConfigSpec> warm_order =
-                    generate_shuffled_config_order(base_specs, suite_cfg.order_seed, dsize, profile, w);
+                const std::vector<BenchmarkConfigSpec> warm_order = paired_mode
+                    ? generate_paired_config_order(base_specs, suite_cfg.order_seed, dsize, profile, w)
+                    : generate_shuffled_config_order(canonical_specs, suite_cfg.order_seed, dsize, profile, w);
                 for (const auto& spec : warm_order) {
                     PipelineResult warm_res;
                     AdaptivePipelineResult warm_adap;
@@ -757,16 +870,19 @@ BenchmarkSuiteResult run_benchmark_suite(
             }
 
             // 2. Interleaved / Randomized Measured Repetition Rounds
-            std::vector<std::vector<BenchmarkSampleRow>> samples_by_canonical_idx(base_specs.size());
+            std::vector<std::vector<BenchmarkSampleRow>> samples_by_canonical_idx(canonical_specs.size());
             for (auto& vec : samples_by_canonical_idx) {
                 vec.reserve(suite_cfg.measured_runs);
             }
 
             for (size_t r = 0; r < suite_cfg.measured_runs; ++r) {
                 const size_t round_idx = suite_cfg.warmup_runs + r;
-                const std::vector<BenchmarkConfigSpec> round_order =
-                    generate_shuffled_config_order(
+                const std::vector<BenchmarkConfigSpec> round_order = paired_mode
+                    ? generate_paired_config_order(
                         base_specs, suite_cfg.order_seed, dsize, profile, round_idx
+                    )
+                    : generate_shuffled_config_order(
+                        canonical_specs, suite_cfg.order_seed, dsize, profile, round_idx
                     );
                 const std::string round_order_str = format_config_order(round_order);
 
@@ -786,9 +902,12 @@ BenchmarkSuiteResult run_benchmark_suite(
                         chunk_sz
                     );
 
+                    PipelineConfig spec_pipeline_cfg = suite_cfg.pipeline_config;
+                    spec_pipeline_cfg.enable_band_suppression = spec.enable_band_suppression;
+
                     BenchmarkSampleRow row = build_sample_row(
                         dcfg,
-                        suite_cfg.pipeline_config,
+                        spec_pipeline_cfg,
                         spec.policy,
                         spec.thread_count,
                         chunk_sz,
@@ -804,9 +923,9 @@ BenchmarkSuiteResult run_benchmark_suite(
 
                     suite_res.raw_samples.push_back(row);
 
-                    auto it = std::find(base_specs.begin(), base_specs.end(), spec);
-                    if (it != base_specs.end()) {
-                        size_t canonical_idx = static_cast<size_t>(std::distance(base_specs.begin(), it));
+                    auto it = std::find(canonical_specs.begin(), canonical_specs.end(), spec);
+                    if (it != canonical_specs.end()) {
+                        size_t canonical_idx = static_cast<size_t>(std::distance(canonical_specs.begin(), it));
                         samples_by_canonical_idx[canonical_idx].push_back(row);
                     }
                 }
@@ -825,15 +944,18 @@ BenchmarkSuiteResult run_benchmark_suite(
             suite_res.summary_rows.push_back(seq_summary);
 
             if (progress_os != nullptr) {
-                *progress_os << "  [Sequential | T=1] Median Total=" << std::fixed
+                *progress_os << "  [Sequential | T=1 | Supp=" << (seq_summary.band_suppression_enabled ? "ON" : "OFF")
+                             << "] Median Total=" << std::fixed
                              << std::setprecision(3) << seq_summary.median_total_ms
                              << " ms | CandGen=" << seq_summary.median_candidate_gen_total_ms
                              << " ms | MaxBucket=" << seq_summary.max_bucket_size
-                             << " | TotalPairs=" << seq_summary.total_estimated_pair_work
+                             << " | EvalPairs=" << seq_summary.raw_candidates_evaluated
+                             << " | EmitPairs=" << seq_summary.raw_candidates_emitted
+                             << " | SuppPairs=" << seq_summary.suppressed_pair_count
                              << " | CV=" << std::setprecision(4) << seq_summary.bucket_work_cv << "\n";
             }
 
-            for (size_t idx = 1; idx < base_specs.size(); ++idx) {
+            for (size_t idx = 1; idx < canonical_specs.size(); ++idx) {
                 BenchmarkSummaryRow summary = summarize_benchmark_samples(
                     samples_by_canonical_idx[idx],
                     suite_cfg.warmup_runs,
@@ -844,7 +966,8 @@ BenchmarkSuiteResult run_benchmark_suite(
 
                 if (progress_os != nullptr) {
                     *progress_os << "  [" << std::setw(10) << std::left << to_string(summary.policy)
-                                 << std::right << " | T=" << summary.configured_threads << "] "
+                                 << std::right << " | T=" << summary.configured_threads
+                                 << " | Supp=" << std::setw(3) << (summary.band_suppression_enabled ? "ON" : "OFF") << "] "
                                  << "Median=" << std::fixed << std::setprecision(3)
                                  << std::setw(7) << summary.median_total_ms << " ms "
                                  << "(IQR=" << std::setw(5) << summary.iqr_total_ms << ") | "
@@ -878,7 +1001,8 @@ void write_raw_csv(std::ostream& os, const std::vector<BenchmarkSampleRow>& rows
        << "work_imbalance_ratio,total_units_processed,per_thread_work_distribution,"
        << "fingerprinting_ms,bucket_construction_ms,candidate_gen_total_ms,"
        << "adaptive_decision_ms,ordinary_candidate_gen_ms,heavy_chunk_gen_ms,"
-       << "heavy_pair_proc_ms,merge_sort_dedup_ms,verification_ms,total_pipeline_ms\n";
+       << "heavy_pair_proc_ms,merge_sort_dedup_ms,verification_ms,total_pipeline_ms,"
+       << "band_suppression_enabled,raw_candidates_evaluated,raw_candidates_emitted,suppressed_pair_count\n";
 
     os << std::fixed;
     for (const auto& r : rows) {
@@ -938,7 +1062,11 @@ void write_raw_csv(std::ostream& os, const std::vector<BenchmarkSampleRow>& rows
            << r.heavy_pair_proc_ms << ','
            << r.merge_sort_dedup_ms << ','
            << r.verification_ms << ','
-           << r.total_pipeline_ms << '\n';
+           << r.total_pipeline_ms << ','
+           << (r.band_suppression_enabled ? 1 : 0) << ','
+           << r.raw_candidates_evaluated << ','
+           << r.raw_candidates_emitted << ','
+           << r.suppressed_pair_count << '\n';
     }
 }
 
@@ -960,7 +1088,8 @@ void write_summary_csv(std::ostream& os, const std::vector<BenchmarkSummaryRow>&
        << "median_heavy_chunk_gen_ms,median_heavy_pair_proc_ms,median_merge_sort_dedup_ms,"
        << "median_verification_ms,"
        << "median_total_ms,mean_total_ms,iqr_total_ms,sd_total_ms,min_total_ms,max_total_ms,"
-       << "speedup_total,efficiency_total,speedup_candidate_gen,efficiency_candidate_gen\n";
+       << "speedup_total,efficiency_total,speedup_candidate_gen,efficiency_candidate_gen,"
+       << "band_suppression_enabled,raw_candidates_evaluated,raw_candidates_emitted,suppressed_pair_count\n";
 
     os << std::fixed;
     for (const auto& r : rows) {
@@ -1030,7 +1159,11 @@ void write_summary_csv(std::ostream& os, const std::vector<BenchmarkSummaryRow>&
            << r.speedup_total << ','
            << r.efficiency_total << ','
            << r.speedup_candidate_gen << ','
-           << r.efficiency_candidate_gen << '\n';
+           << r.efficiency_candidate_gen << ','
+           << (r.band_suppression_enabled ? 1 : 0) << ','
+           << r.raw_candidates_evaluated << ','
+           << r.raw_candidates_emitted << ','
+           << r.suppressed_pair_count << '\n';
     }
 }
 

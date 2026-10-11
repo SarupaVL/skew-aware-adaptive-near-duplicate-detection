@@ -476,7 +476,10 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
 
     auto pipeline_start = SteadyClock::now();
 
+    const bool suppression_enabled = config.enable_band_suppression || config.base_config.enable_band_suppression;
+
     PipelineResult result;
+    result.band_suppression_enabled = suppression_enabled;
     size_t num_docs = documents.size();
     result.document_ids.resize(num_docs);
     result.fingerprints.resize(num_docs);
@@ -485,6 +488,8 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
         result.actual_thread_count = 0;
         result.per_thread_pair_work.assign(static_cast<size_t>(config.thread_count), 0ULL);
         result.per_thread_units_processed.assign(static_cast<size_t>(config.thread_count), 0);
+        result.per_thread_emitted_pairs.assign(static_cast<size_t>(config.thread_count), 0ULL);
+        result.per_thread_suppressed_pairs.assign(static_cast<size_t>(config.thread_count), 0ULL);
         auto pipeline_end = SteadyClock::now();
         result.timings.total_pipeline_ms = elapsed_ms(pipeline_start, pipeline_end);
         return result;
@@ -542,14 +547,28 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     auto t2_start = SteadyClock::now();
 
     std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_table;
+    std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_fp_table;
 
-    for (size_t i = 0; i < num_docs; ++i) {
-        uint64_t doc_id = result.document_ids[i];
-        uint64_t fp = result.fingerprints[i];
+    if (!suppression_enabled) {
+        for (size_t i = 0; i < num_docs; ++i) {
+            uint64_t doc_id = result.document_ids[i];
+            uint64_t fp = result.fingerprints[i];
 
-        for (size_t band = 0; band < kNumBands; ++band) {
-            uint8_t val = extract_band(fp, band);
-            buckets_table[band][val].push_back(doc_id);
+            for (size_t band = 0; band < kNumBands; ++band) {
+                uint8_t val = extract_band(fp, band);
+                buckets_table[band][val].push_back(doc_id);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < num_docs; ++i) {
+            uint64_t doc_id = result.document_ids[i];
+            uint64_t fp = result.fingerprints[i];
+
+            for (size_t band = 0; band < kNumBands; ++band) {
+                uint8_t val = extract_band(fp, band);
+                buckets_table[band][val].push_back(doc_id);
+                buckets_fp_table[band][val].push_back(fp);
+            }
         }
     }
 
@@ -557,9 +576,13 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     size_t total_occupied_docs = 0;
     std::vector<uint64_t> positive_works;
 
-    // Also collect pointers to buckets having >= 2 documents for parallel candidate generation
+    // Also collect pointers / BucketInfos for buckets having >= 2 documents for parallel candidate generation
     std::vector<const std::vector<uint64_t>*> active_buckets;
+    std::vector<BucketInfo> active_bucket_infos;
     active_buckets.reserve(kNumBands * 256);
+    if (suppression_enabled) {
+        active_bucket_infos.reserve(kNumBands * 256);
+    }
 
     for (size_t band = 0; band < kNumBands; ++band) {
         for (size_t val = 0; val < 256; ++val) {
@@ -587,6 +610,9 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
                     result.workload_stats.positive_work_buckets++;
                     positive_works.push_back(binfo.estimated_pair_work);
                     active_buckets.push_back(&bucket_docs);
+                    if (suppression_enabled) {
+                        active_bucket_infos.push_back(binfo);
+                    }
                 }
 
                 result.buckets.push_back(binfo);
@@ -640,9 +666,9 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     //   avoids TLS overhead, limits, or barrier synchronization.
     // - Thread `tid` appends pairs exclusively to its dedicated slot `per_thread_candidates[tid]`.
     // - Completely avoids mutexes, locks, or critical sections.
-    // - After parallel loop, per-thread slots are sequentially concatenated.
-    // - Final candidates are sorted and deduplicated via std::unique to guarantee
-    //   bitwise-deterministic candidate ordering identical to sequential execution.
+    // - After parallel loop, per-thread slots are aggregated, sorted, and deduplicated
+    //   via ordered range partitioning to guarantee bitwise-deterministic candidate ordering
+    //   identical to sequential execution.
     auto t3_start = SteadyClock::now();
 
     size_t num_active_buckets = active_buckets.size();
@@ -650,49 +676,150 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     std::vector<size_t> per_thread_units(config.thread_count, 0);
     int observed_team_size = config.thread_count;
 
-    #pragma omp parallel num_threads(config.thread_count) default(none) \
-        shared(active_buckets, num_active_buckets, per_thread_candidates, per_thread_units, observed_team_size)
-    {
-        int tid = omp_get_thread_num();
-        size_t local_units = 0;
-
-        #pragma omp single
+    if (!suppression_enabled) {
+        #pragma omp parallel num_threads(config.thread_count) default(none) \
+            shared(active_buckets, num_active_buckets, per_thread_candidates, per_thread_units, observed_team_size)
         {
-            int actual_threads = omp_get_num_threads();
-            observed_team_size = actual_threads;
-            if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
-                per_thread_candidates.resize(actual_threads);
-                per_thread_units.resize(actual_threads, 0);
+            int tid = omp_get_thread_num();
+            size_t local_units = 0;
+
+            #pragma omp single
+            {
+                int actual_threads = omp_get_num_threads();
+                observed_team_size = actual_threads;
+                if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
+                    per_thread_candidates.resize(actual_threads);
+                    per_thread_units.resize(actual_threads, 0);
+                }
             }
-        }
 
-        #pragma omp for schedule(runtime)
-        for (size_t b = 0; b < num_active_buckets; ++b) {
-            ++local_units;
-            const auto& bucket_docs = *active_buckets[b];
-            size_t bsize = bucket_docs.size();
+            #pragma omp for schedule(runtime)
+            for (size_t b = 0; b < num_active_buckets; ++b) {
+                ++local_units;
+                const auto& bucket_docs = *active_buckets[b];
+                size_t bsize = bucket_docs.size();
 
-            for (size_t i = 0; i < bsize; ++i) {
-                for (size_t j = i + 1; j < bsize; ++j) {
-                    uint64_t u = bucket_docs[i];
-                    uint64_t v = bucket_docs[j];
-                    if (u != v) {
-                        CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
-                        per_thread_candidates[tid].push_back(pair);
+                for (size_t i = 0; i < bsize; ++i) {
+                    for (size_t j = i + 1; j < bsize; ++j) {
+                        uint64_t u = bucket_docs[i];
+                        uint64_t v = bucket_docs[j];
+                        if (u != v) {
+                            CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                            per_thread_candidates[tid].push_back(pair);
+                        }
                     }
                 }
             }
+
+            per_thread_units[tid] = local_units;
         }
 
-        per_thread_units[tid] = local_units;
-    }
+        result.actual_thread_count = observed_team_size;
+        result.per_thread_pair_work.resize(per_thread_candidates.size(), 0ULL);
+        result.per_thread_emitted_pairs.resize(per_thread_candidates.size(), 0ULL);
+        result.per_thread_suppressed_pairs.assign(per_thread_candidates.size(), 0ULL);
+        uint64_t total_emitted = 0;
+        for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
+            uint64_t count = static_cast<uint64_t>(per_thread_candidates[t].size());
+            result.per_thread_pair_work[t] = count;
+            result.per_thread_emitted_pairs[t] = count;
+            total_emitted += count;
+        }
+        result.raw_candidates_evaluated = total_emitted;
+        result.raw_candidates_emitted = total_emitted;
+        result.suppressed_pair_count = 0;
+        result.per_thread_units_processed = std::move(per_thread_units);
+    } else {
+        std::vector<uint64_t> per_thread_evaluated(config.thread_count, 0ULL);
+        std::vector<uint64_t> per_thread_suppressed(config.thread_count, 0ULL);
 
-    result.actual_thread_count = observed_team_size;
-    result.per_thread_pair_work.resize(per_thread_candidates.size(), 0ULL);
-    for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
-        result.per_thread_pair_work[t] = static_cast<uint64_t>(per_thread_candidates[t].size());
+        #pragma omp parallel num_threads(config.thread_count) default(none) \
+            shared(active_bucket_infos, num_active_buckets, buckets_table, buckets_fp_table, \
+                   per_thread_candidates, per_thread_units, per_thread_evaluated, \
+                   per_thread_suppressed, observed_team_size)
+        {
+            int tid = omp_get_thread_num();
+            size_t local_units = 0;
+            uint64_t local_evaluated = 0;
+            uint64_t local_suppressed = 0;
+
+            #pragma omp single
+            {
+                int actual_threads = omp_get_num_threads();
+                observed_team_size = actual_threads;
+                if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
+                    per_thread_candidates.resize(actual_threads);
+                    per_thread_units.resize(actual_threads, 0);
+                    per_thread_evaluated.resize(actual_threads, 0ULL);
+                    per_thread_suppressed.resize(actual_threads, 0ULL);
+                }
+            }
+
+            #pragma omp for schedule(runtime)
+            for (size_t b = 0; b < num_active_buckets; ++b) {
+                ++local_units;
+                const BucketInfo& binfo = active_bucket_infos[b];
+                const auto& bucket_docs = buckets_table[binfo.band_index][binfo.band_value];
+                const size_t bsize = bucket_docs.size();
+
+                if (binfo.band_index == 0) {
+                    for (size_t i = 0; i < bsize; ++i) {
+                        uint64_t u = bucket_docs[i];
+                        for (size_t j = i + 1; j < bsize; ++j) {
+                            ++local_evaluated;
+                            uint64_t v = bucket_docs[j];
+                            if (u != v) {
+                                CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                per_thread_candidates[tid].push_back(pair);
+                            }
+                        }
+                    }
+                } else {
+                    const uint64_t earlier_mask = earlier_band_msb_mask(binfo.band_index);
+                    const auto& bucket_fps = buckets_fp_table[binfo.band_index][binfo.band_value];
+                    for (size_t i = 0; i < bsize; ++i) {
+                        uint64_t u = bucket_docs[i];
+                        uint64_t fp_u = bucket_fps[i];
+                        for (size_t j = i + 1; j < bsize; ++j) {
+                            ++local_evaluated;
+                            if (matched_in_earlier_band_swar_mask(fp_u, bucket_fps[j], earlier_mask)) {
+                                ++local_suppressed;
+                                continue;
+                            }
+                            uint64_t v = bucket_docs[j];
+                            if (u != v) {
+                                CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                per_thread_candidates[tid].push_back(pair);
+                            }
+                        }
+                    }
+                }
+            }
+
+            per_thread_units[tid] = local_units;
+            per_thread_evaluated[tid] = local_evaluated;
+            per_thread_suppressed[tid] = local_suppressed;
+        }
+
+        result.actual_thread_count = observed_team_size;
+        result.per_thread_pair_work = std::move(per_thread_evaluated);
+        result.per_thread_emitted_pairs.resize(per_thread_candidates.size(), 0ULL);
+        result.per_thread_suppressed_pairs = std::move(per_thread_suppressed);
+        uint64_t total_evaluated = 0;
+        uint64_t total_emitted = 0;
+        uint64_t total_suppressed = 0;
+        for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
+            uint64_t emitted = static_cast<uint64_t>(per_thread_candidates[t].size());
+            result.per_thread_emitted_pairs[t] = emitted;
+            total_evaluated += result.per_thread_pair_work[t];
+            total_emitted += emitted;
+            total_suppressed += result.per_thread_suppressed_pairs[t];
+        }
+        result.raw_candidates_evaluated = total_evaluated;
+        result.raw_candidates_emitted = total_emitted;
+        result.suppressed_pair_count = total_suppressed;
+        result.per_thread_units_processed = std::move(per_thread_units);
     }
-    result.per_thread_units_processed = std::move(per_thread_units);
 
     // Aggregate, sort, and deduplicate per-thread candidate lists in parallel using ordered range partitioning
     result.candidate_pairs = aggregate_and_deduplicate_candidates(
@@ -968,11 +1095,15 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
 
     auto pipeline_start = SteadyClock::now();
 
+    const bool suppression_enabled = config.enable_band_suppression || config.base_config.enable_band_suppression;
+
     AdaptivePipelineResult adaptive_res;
     PipelineResult& result = adaptive_res.pipeline_result;
     AdaptiveDiagnostics& diag = adaptive_res.diagnostics;
     AdaptiveStageTimings& timings = adaptive_res.adaptive_timings;
 
+    result.band_suppression_enabled = suppression_enabled;
+    diag.band_suppression_enabled = suppression_enabled;
     diag.cv_threshold = config.cv_threshold;
     diag.oversized_bucket_multiplier = config.oversized_bucket_multiplier;
     diag.configured_thread_count = config.thread_count;
@@ -993,8 +1124,12 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         result.actual_thread_count = 0;
         result.per_thread_pair_work.assign(static_cast<size_t>(config.thread_count), 0ULL);
         result.per_thread_units_processed.assign(static_cast<size_t>(config.thread_count), 0);
+        result.per_thread_emitted_pairs.assign(static_cast<size_t>(config.thread_count), 0ULL);
+        result.per_thread_suppressed_pairs.assign(static_cast<size_t>(config.thread_count), 0ULL);
         diag.per_thread_pair_work = result.per_thread_pair_work;
         diag.per_thread_units_processed = result.per_thread_units_processed;
+        diag.per_thread_emitted_pairs = result.per_thread_emitted_pairs;
+        diag.per_thread_suppressed_pairs = result.per_thread_suppressed_pairs;
         auto decision_end = SteadyClock::now();
 
         timings.adaptive_decision_ms = elapsed_ms(decision_start, decision_end);
@@ -1056,14 +1191,28 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     auto t2_start = SteadyClock::now();
 
     std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_table;
+    std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_fp_table;
 
-    for (size_t i = 0; i < num_docs; ++i) {
-        uint64_t doc_id = result.document_ids[i];
-        uint64_t fp = result.fingerprints[i];
+    if (!suppression_enabled) {
+        for (size_t i = 0; i < num_docs; ++i) {
+            uint64_t doc_id = result.document_ids[i];
+            uint64_t fp = result.fingerprints[i];
 
-        for (size_t band = 0; band < kNumBands; ++band) {
-            uint8_t val = extract_band(fp, band);
-            buckets_table[band][val].push_back(doc_id);
+            for (size_t band = 0; band < kNumBands; ++band) {
+                uint8_t val = extract_band(fp, band);
+                buckets_table[band][val].push_back(doc_id);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < num_docs; ++i) {
+            uint64_t doc_id = result.document_ids[i];
+            uint64_t fp = result.fingerprints[i];
+
+            for (size_t band = 0; band < kNumBands; ++band) {
+                uint8_t val = extract_band(fp, band);
+                buckets_table[band][val].push_back(doc_id);
+                buckets_fp_table[band][val].push_back(fp);
+            }
         }
     }
 
@@ -1154,6 +1303,7 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     );
 
     std::vector<const std::vector<uint64_t>*> ordinary_bucket_ptrs;
+    std::vector<BucketInfo> ordinary_bucket_infos;
     std::vector<BucketInfo> oversized_bucket_infos;
 
     if (diag.positive_work_buckets > 0 && diag.mean_positive_pair_work > 0.0) {
@@ -1161,6 +1311,9 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
             config.oversized_bucket_multiplier * diag.mean_positive_pair_work;
 
         ordinary_bucket_ptrs.reserve(positive_bucket_infos.size());
+        if (suppression_enabled) {
+            ordinary_bucket_infos.reserve(positive_bucket_infos.size());
+        }
         for (const auto& binfo : positive_bucket_infos) {
             if (static_cast<double>(binfo.estimated_pair_work) > diag.oversized_pair_work_threshold) {
                 oversized_bucket_infos.push_back(binfo);
@@ -1168,6 +1321,9 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
                 diag.oversized_pair_work += binfo.estimated_pair_work;
             } else {
                 ordinary_bucket_ptrs.push_back(&buckets_table[binfo.band_index][binfo.band_value]);
+                if (suppression_enabled) {
+                    ordinary_bucket_infos.push_back(binfo);
+                }
                 diag.ordinary_buckets++;
                 diag.ordinary_pair_work += binfo.estimated_pair_work;
             }
@@ -1184,6 +1340,8 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     size_t team_slots = static_cast<size_t>(std::max(config.thread_count, diag.actual_thread_count));
     std::vector<std::vector<CandidatePair>> per_thread_candidates(team_slots);
     std::vector<size_t> per_thread_units(team_slots, 0);
+    std::vector<uint64_t> per_thread_evaluated(team_slots, 0ULL);
+    std::vector<uint64_t> per_thread_suppressed(team_slots, 0ULL);
 
     // -------------------------------------------------------------
     // Stage 3b: Ordinary-Bucket Candidate Generation
@@ -1196,40 +1354,108 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
             diag.selected_ordinary_policy, config.ordinary_chunk_size
         );
 
-        #pragma omp parallel num_threads(config.thread_count) default(none) \
-            shared(ordinary_bucket_ptrs, num_ordinary, per_thread_candidates, per_thread_units)
-        {
-            int tid = omp_get_thread_num();
-            size_t local_units = 0;
-
-            #pragma omp single
+        if (!suppression_enabled) {
+            #pragma omp parallel num_threads(config.thread_count) default(none) \
+                shared(ordinary_bucket_ptrs, num_ordinary, per_thread_candidates, per_thread_units)
             {
-                int actual_threads = omp_get_num_threads();
-                if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
-                    per_thread_candidates.resize(actual_threads);
-                    per_thread_units.resize(actual_threads, 0);
+                int tid = omp_get_thread_num();
+                size_t local_units = 0;
+
+                #pragma omp single
+                {
+                    int actual_threads = omp_get_num_threads();
+                    if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
+                        per_thread_candidates.resize(actual_threads);
+                        per_thread_units.resize(actual_threads, 0);
+                    }
                 }
-            }
 
-            #pragma omp for schedule(runtime)
-            for (size_t b = 0; b < num_ordinary; ++b) {
-                ++local_units;
-                const auto& bucket_docs = *ordinary_bucket_ptrs[b];
-                size_t bsize = bucket_docs.size();
+                #pragma omp for schedule(runtime)
+                for (size_t b = 0; b < num_ordinary; ++b) {
+                    ++local_units;
+                    const auto& bucket_docs = *ordinary_bucket_ptrs[b];
+                    size_t bsize = bucket_docs.size();
 
-                for (size_t i = 0; i < bsize; ++i) {
-                    for (size_t j = i + 1; j < bsize; ++j) {
-                        uint64_t u = bucket_docs[i];
-                        uint64_t v = bucket_docs[j];
-                        if (u != v) {
-                            CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
-                            per_thread_candidates[tid].push_back(pair);
+                    for (size_t i = 0; i < bsize; ++i) {
+                        for (size_t j = i + 1; j < bsize; ++j) {
+                            uint64_t u = bucket_docs[i];
+                            uint64_t v = bucket_docs[j];
+                            if (u != v) {
+                                CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                per_thread_candidates[tid].push_back(pair);
+                            }
                         }
                     }
                 }
-            }
 
-            per_thread_units[tid] += local_units;
+                per_thread_units[tid] += local_units;
+            }
+        } else {
+            #pragma omp parallel num_threads(config.thread_count) default(none) \
+                shared(ordinary_bucket_infos, num_ordinary, buckets_table, buckets_fp_table, \
+                       per_thread_candidates, per_thread_units, per_thread_evaluated, per_thread_suppressed)
+            {
+                int tid = omp_get_thread_num();
+                size_t local_units = 0;
+                uint64_t local_evaluated = 0;
+                uint64_t local_suppressed = 0;
+
+                #pragma omp single
+                {
+                    int actual_threads = omp_get_num_threads();
+                    if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
+                        per_thread_candidates.resize(actual_threads);
+                        per_thread_units.resize(actual_threads, 0);
+                        per_thread_evaluated.resize(actual_threads, 0ULL);
+                        per_thread_suppressed.resize(actual_threads, 0ULL);
+                    }
+                }
+
+                #pragma omp for schedule(runtime)
+                for (size_t b = 0; b < num_ordinary; ++b) {
+                    ++local_units;
+                    const BucketInfo& binfo = ordinary_bucket_infos[b];
+                    const auto& bucket_docs = buckets_table[binfo.band_index][binfo.band_value];
+                    const size_t bsize = bucket_docs.size();
+
+                    if (binfo.band_index == 0) {
+                        for (size_t i = 0; i < bsize; ++i) {
+                            uint64_t u = bucket_docs[i];
+                            for (size_t j = i + 1; j < bsize; ++j) {
+                                ++local_evaluated;
+                                uint64_t v = bucket_docs[j];
+                                if (u != v) {
+                                    CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                    per_thread_candidates[tid].push_back(pair);
+                                }
+                            }
+                        }
+                    } else {
+                        const uint64_t earlier_mask = earlier_band_msb_mask(binfo.band_index);
+                        const auto& bucket_fps = buckets_fp_table[binfo.band_index][binfo.band_value];
+                        for (size_t i = 0; i < bsize; ++i) {
+                            uint64_t u = bucket_docs[i];
+                            uint64_t fp_u = bucket_fps[i];
+                            for (size_t j = i + 1; j < bsize; ++j) {
+                                ++local_evaluated;
+                                if (matched_in_earlier_band_swar_mask(fp_u, bucket_fps[j], earlier_mask)) {
+                                    ++local_suppressed;
+                                    continue;
+                                }
+                                uint64_t v = bucket_docs[j];
+                                if (u != v) {
+                                    CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                    per_thread_candidates[tid].push_back(pair);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                per_thread_units[tid] += local_units;
+                per_thread_evaluated[tid] += local_evaluated;
+                per_thread_suppressed[tid] += local_suppressed;
+            }
         }
     }
 
@@ -1273,51 +1499,139 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
 
         const auto& heavy_chunks_ref = adaptive_res.heavy_chunks;
 
-        #pragma omp parallel num_threads(config.thread_count) default(none) \
-            shared(heavy_chunks_ref, num_heavy_chunks, buckets_table, per_thread_candidates, per_thread_units)
-        {
-            int tid = omp_get_thread_num();
-            size_t local_units = 0;
-
-            #pragma omp single
+        if (!suppression_enabled) {
+            #pragma omp parallel num_threads(config.thread_count) default(none) \
+                shared(heavy_chunks_ref, num_heavy_chunks, buckets_table, per_thread_candidates, per_thread_units)
             {
-                int actual_threads = omp_get_num_threads();
-                if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
-                    per_thread_candidates.resize(actual_threads);
-                    per_thread_units.resize(actual_threads, 0);
+                int tid = omp_get_thread_num();
+                size_t local_units = 0;
+
+                #pragma omp single
+                {
+                    int actual_threads = omp_get_num_threads();
+                    if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
+                        per_thread_candidates.resize(actual_threads);
+                        per_thread_units.resize(actual_threads, 0);
+                    }
                 }
-            }
 
-            #pragma omp for schedule(runtime)
-            for (size_t c = 0; c < num_heavy_chunks; ++c) {
-                ++local_units;
-                const HeavyBucketChunk& chunk = heavy_chunks_ref[c];
-                const auto& bucket_docs = buckets_table[chunk.band_index][chunk.band_value];
-                size_t bsize = bucket_docs.size();
+                #pragma omp for schedule(runtime)
+                for (size_t c = 0; c < num_heavy_chunks; ++c) {
+                    ++local_units;
+                    const HeavyBucketChunk& chunk = heavy_chunks_ref[c];
+                    const auto& bucket_docs = buckets_table[chunk.band_index][chunk.band_value];
+                    size_t bsize = bucket_docs.size();
 
-                if (chunk.start_pair_pos < chunk.end_pair_pos) {
-                    // Unrank the starting linear pair position into its initial (i, j) indices once,
-                    // then advance (i, j) lexicographically in O(1) across the chunk's range.
-                    auto [i, j] = unrank_pair_position(bsize, chunk.start_pair_pos);
+                    if (chunk.start_pair_pos < chunk.end_pair_pos) {
+                        // Unrank the starting linear pair position into its initial (i, j) indices once,
+                        // then advance (i, j) lexicographically in O(1) across the chunk's range.
+                        auto [i, j] = unrank_pair_position(bsize, chunk.start_pair_pos);
 
-                    for (uint64_t pos = chunk.start_pair_pos; pos < chunk.end_pair_pos; ++pos) {
-                        uint64_t u = bucket_docs[i];
-                        uint64_t v = bucket_docs[j];
-                        if (u != v) {
-                            CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
-                            per_thread_candidates[tid].push_back(pair);
-                        }
+                        for (uint64_t pos = chunk.start_pair_pos; pos < chunk.end_pair_pos; ++pos) {
+                            uint64_t u = bucket_docs[i];
+                            uint64_t v = bucket_docs[j];
+                            if (u != v) {
+                                CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                per_thread_candidates[tid].push_back(pair);
+                            }
 
-                        ++j;
-                        if (j >= bsize) {
-                            ++i;
-                            j = i + 1;
+                            ++j;
+                            if (j >= bsize) {
+                                ++i;
+                                j = i + 1;
+                            }
                         }
                     }
                 }
-            }
 
-            per_thread_units[tid] += local_units;
+                per_thread_units[tid] += local_units;
+            }
+        } else {
+            #pragma omp parallel num_threads(config.thread_count) default(none) \
+                shared(heavy_chunks_ref, num_heavy_chunks, buckets_table, buckets_fp_table, \
+                       per_thread_candidates, per_thread_units, per_thread_evaluated, per_thread_suppressed)
+            {
+                int tid = omp_get_thread_num();
+                size_t local_units = 0;
+                uint64_t local_evaluated = 0;
+                uint64_t local_suppressed = 0;
+
+                #pragma omp single
+                {
+                    int actual_threads = omp_get_num_threads();
+                    if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
+                        per_thread_candidates.resize(actual_threads);
+                        per_thread_units.resize(actual_threads, 0);
+                        per_thread_evaluated.resize(actual_threads, 0ULL);
+                        per_thread_suppressed.resize(actual_threads, 0ULL);
+                    }
+                }
+
+                #pragma omp for schedule(runtime)
+                for (size_t c = 0; c < num_heavy_chunks; ++c) {
+                    ++local_units;
+                    const HeavyBucketChunk& chunk = heavy_chunks_ref[c];
+                    const auto& bucket_docs = buckets_table[chunk.band_index][chunk.band_value];
+                    const size_t bsize = bucket_docs.size();
+
+                    if (chunk.start_pair_pos < chunk.end_pair_pos) {
+                        auto [i, j] = unrank_pair_position(bsize, chunk.start_pair_pos);
+
+                        if (chunk.band_index == 0) {
+                            uint64_t u = bucket_docs[i];
+                            for (uint64_t pos = chunk.start_pair_pos; pos < chunk.end_pair_pos; ++pos) {
+                                ++local_evaluated;
+                                uint64_t v = bucket_docs[j];
+                                if (u != v) {
+                                    CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                    per_thread_candidates[tid].push_back(pair);
+                                }
+
+                                ++j;
+                                if (j >= bsize) {
+                                    ++i;
+                                    j = i + 1;
+                                    if (i < bsize) {
+                                        u = bucket_docs[i];
+                                    }
+                                }
+                            }
+                        } else {
+                            const uint64_t earlier_mask = earlier_band_msb_mask(chunk.band_index);
+                            const auto& bucket_fps = buckets_fp_table[chunk.band_index][chunk.band_value];
+                            uint64_t u = bucket_docs[i];
+                            uint64_t fp_u = bucket_fps[i];
+
+                            for (uint64_t pos = chunk.start_pair_pos; pos < chunk.end_pair_pos; ++pos) {
+                                ++local_evaluated;
+                                if (matched_in_earlier_band_swar_mask(fp_u, bucket_fps[j], earlier_mask)) {
+                                    ++local_suppressed;
+                                } else {
+                                    uint64_t v = bucket_docs[j];
+                                    if (u != v) {
+                                        CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                        per_thread_candidates[tid].push_back(pair);
+                                    }
+                                }
+
+                                ++j;
+                                if (j >= bsize) {
+                                    ++i;
+                                    j = i + 1;
+                                    if (i < bsize) {
+                                        u = bucket_docs[i];
+                                        fp_u = bucket_fps[i];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                per_thread_units[tid] += local_units;
+                per_thread_evaluated[tid] += local_evaluated;
+                per_thread_suppressed[tid] += local_suppressed;
+            }
         }
     }
 
@@ -1330,13 +1644,46 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     auto t3e_start = SteadyClock::now();
 
     result.actual_thread_count = diag.actual_thread_count;
-    result.per_thread_pair_work.resize(per_thread_candidates.size(), 0ULL);
-    for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
-        result.per_thread_pair_work[t] = static_cast<uint64_t>(per_thread_candidates[t].size());
+    if (!suppression_enabled) {
+        result.per_thread_pair_work.resize(per_thread_candidates.size(), 0ULL);
+        result.per_thread_emitted_pairs.resize(per_thread_candidates.size(), 0ULL);
+        result.per_thread_suppressed_pairs.assign(per_thread_candidates.size(), 0ULL);
+        uint64_t total_emitted = 0;
+        for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
+            uint64_t count = static_cast<uint64_t>(per_thread_candidates[t].size());
+            result.per_thread_pair_work[t] = count;
+            result.per_thread_emitted_pairs[t] = count;
+            total_emitted += count;
+        }
+        result.raw_candidates_evaluated = total_emitted;
+        result.raw_candidates_emitted = total_emitted;
+        result.suppressed_pair_count = 0;
+    } else {
+        result.per_thread_pair_work = std::move(per_thread_evaluated);
+        result.per_thread_emitted_pairs.resize(per_thread_candidates.size(), 0ULL);
+        result.per_thread_suppressed_pairs = std::move(per_thread_suppressed);
+        uint64_t total_evaluated = 0;
+        uint64_t total_emitted = 0;
+        uint64_t total_suppressed = 0;
+        for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
+            uint64_t emitted = static_cast<uint64_t>(per_thread_candidates[t].size());
+            result.per_thread_emitted_pairs[t] = emitted;
+            total_evaluated += result.per_thread_pair_work[t];
+            total_emitted += emitted;
+            total_suppressed += result.per_thread_suppressed_pairs[t];
+        }
+        result.raw_candidates_evaluated = total_evaluated;
+        result.raw_candidates_emitted = total_emitted;
+        result.suppressed_pair_count = total_suppressed;
     }
     result.per_thread_units_processed = std::move(per_thread_units);
     diag.per_thread_pair_work = result.per_thread_pair_work;
     diag.per_thread_units_processed = result.per_thread_units_processed;
+    diag.raw_candidates_evaluated = result.raw_candidates_evaluated;
+    diag.raw_candidates_emitted = result.raw_candidates_emitted;
+    diag.suppressed_pair_count = result.suppressed_pair_count;
+    diag.per_thread_emitted_pairs = result.per_thread_emitted_pairs;
+    diag.per_thread_suppressed_pairs = result.per_thread_suppressed_pairs;
 
     result.candidate_pairs = aggregate_and_deduplicate_candidates(
         per_thread_candidates, config.thread_count

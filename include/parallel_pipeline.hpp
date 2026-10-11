@@ -77,6 +77,7 @@ struct ParallelConfig {
     int thread_count{4};                           ///< Number of OpenMP threads to employ (must be > 0).
     SchedulePolicy schedule_policy{SchedulePolicy::Static}; ///< OpenMP loop schedule policy.
     int chunk_size{0};                             ///< Chunk size for schedule (0 = OpenMP default).
+    bool enable_band_suppression{false};           ///< Opt-in band-aware duplicate suppression (Phase 10, default: false).
 
     /**
      * @brief Validates parallel configuration settings. Throws std::invalid_argument if invalid.
@@ -94,6 +95,7 @@ struct AdaptiveConfig {
     double oversized_bucket_multiplier{kDefaultOversizedMultiplier};    ///< Multiplier over mean positive pair work (must be > 0 and finite).
     uint64_t max_pair_task_size{kDefaultMaxPairTaskSize};               ///< Max pair positions per heavy-bucket chunk (must be > 0).
     int ordinary_chunk_size{0};                                         ///< OpenMP chunk size for ordinary buckets (0 = OpenMP default, >= 0).
+    bool enable_band_suppression{false};                                ///< Opt-in band-aware duplicate suppression (Phase 10, default: false).
 
     /**
      * @brief Validates adaptive configuration settings. Throws std::invalid_argument if invalid.
@@ -151,6 +153,12 @@ struct AdaptiveDiagnostics {
     uint64_t max_pair_task_size{kDefaultMaxPairTaskSize};               ///< Configured maximum pair positions per chunk.
     std::vector<uint64_t> per_thread_pair_work;                         ///< Estimated pair positions (W_t) assigned per worker thread.
     std::vector<size_t> per_thread_units_processed;                     ///< Total ordinary buckets + heavy chunks processed per worker thread.
+    bool band_suppression_enabled{false};                               ///< Whether band-aware duplicate suppression was active.
+    uint64_t raw_candidates_evaluated{0};                               ///< Total bucket pair positions evaluated across all bands.
+    uint64_t raw_candidates_emitted{0};                                 ///< Total raw candidate pairs emitted before Stage 3e aggregation.
+    uint64_t suppressed_pair_count{0};                                  ///< Duplicate pair emissions suppressed across bands 1..7.
+    std::vector<uint64_t> per_thread_emitted_pairs;                     ///< Raw candidate pairs emitted per worker thread.
+    std::vector<uint64_t> per_thread_suppressed_pairs;                  ///< Duplicate pairs suppressed per worker thread.
 
     void print(std::ostream& os) const;
 };

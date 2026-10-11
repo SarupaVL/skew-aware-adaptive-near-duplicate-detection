@@ -118,14 +118,17 @@ WorkBalanceMetrics compute_work_balance_metrics(
 );
 
 /**
- * @brief Identifies one benchmark configuration (policy + thread count) to execute on a dataset.
+ * @brief Identifies one benchmark configuration (policy + thread count + suppression variant) to execute on a dataset.
  */
 struct BenchmarkConfigSpec {
     BenchmarkPolicy policy{BenchmarkPolicy::Sequential};
     int thread_count{1};
+    bool enable_band_suppression{false};
 
     bool operator==(const BenchmarkConfigSpec& other) const noexcept {
-        return policy == other.policy && thread_count == other.thread_count;
+        return policy == other.policy &&
+               thread_count == other.thread_count &&
+               enable_band_suppression == other.enable_band_suppression;
     }
 
     bool operator!=(const BenchmarkConfigSpec& other) const noexcept {
@@ -154,6 +157,22 @@ std::vector<BenchmarkConfigSpec> build_dataset_config_specs(
  * interleaves policies across the timeline while remaining 100% reproducible from order_seed.
  */
 std::vector<BenchmarkConfigSpec> generate_shuffled_config_order(
+    const std::vector<BenchmarkConfigSpec>& base_specs,
+    uint64_t order_seed,
+    size_t dataset_size,
+    WorkloadProfile profile,
+    size_t round_index
+);
+
+/**
+ * @brief Produces a deterministic paired schedule of baseline (`enable_band_suppression = false`)
+ *        and suppression-enabled (`enable_band_suppression = true`) variants in the same process.
+ *
+ * Shuffles the canonical `(policy, thread_count)` configurations for `round_index` and expands
+ * each configuration at rank `k` into an adjacent pair of variants whose order alternates across
+ * rounds (`((round_index + k) & 1) == 0` -> Baseline then Suppression; otherwise Suppression then Baseline).
+ */
+std::vector<BenchmarkConfigSpec> generate_paired_config_order(
     const std::vector<BenchmarkConfigSpec>& base_specs,
     uint64_t order_seed,
     size_t dataset_size,
@@ -248,6 +267,12 @@ struct BenchmarkSampleRow {
     double merge_sort_dedup_ms{0.0};
     double verification_ms{0.0};
     double total_pipeline_ms{0.0};
+
+    // Band-aware duplicate suppression metrics (Phase 10)
+    bool band_suppression_enabled{false};
+    uint64_t raw_candidates_evaluated{0};
+    uint64_t raw_candidates_emitted{0};
+    uint64_t suppressed_pair_count{0};
 };
 
 /**
@@ -335,6 +360,12 @@ struct BenchmarkSummaryRow {
     double efficiency_total{1.0};
     double speedup_candidate_gen{1.0};
     double efficiency_candidate_gen{1.0};
+
+    // Band-aware duplicate suppression metrics (Phase 10)
+    bool band_suppression_enabled{false};
+    uint64_t raw_candidates_evaluated{0};
+    uint64_t raw_candidates_emitted{0};
+    uint64_t suppressed_pair_count{0};
 };
 
 /**
@@ -357,6 +388,8 @@ struct BenchmarkSuiteConfig {
     // Pipeline parameters
     PipelineConfig pipeline_config{};
     int fixed_chunk_size{0}; ///< 0 = OpenMP default chunk size
+    bool enable_band_suppression{false}; ///< Opt-in band-aware duplicate suppression (Phase 10, default: false)
+    bool compare_band_suppression{false}; ///< Paired in-process comparison of baseline and suppression variants (Phase 10)
 
     // Adaptive pipeline parameters (kept at primary Phase 5 defaults)
     double cv_threshold{kDefaultCvThreshold};                         ///< 1.0

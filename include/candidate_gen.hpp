@@ -130,10 +130,11 @@ struct StageTimings {
 struct PipelineConfig {
     size_t shingle_size{kDefaultShingleSize};       ///< Token shingle size for SimHash (default: 3).
     int max_hamming_threshold{kDefaultHammingThreshold}; ///< Distance threshold for match (default: 3).
+    bool enable_band_suppression{false};            ///< Opt-in band-aware duplicate suppression (Phase 10, default: false).
 };
 
 /**
- * @brief Comprehensive results produced by running the sequential pipeline.
+ * @brief Comprehensive results produced by running the sequential or parallel pipeline.
  */
 struct PipelineResult {
     std::vector<uint64_t> document_ids;           ///< Associated document IDs.
@@ -144,8 +145,14 @@ struct PipelineResult {
     WorkloadStatistics workload_stats;            ///< Workload distribution statistics.
     StageTimings timings;                         ///< Stage timings in milliseconds.
     int actual_thread_count{1};                   ///< Worker threads in team (1 for sequential).
-    std::vector<uint64_t> per_thread_pair_work;   ///< Estimated pair positions (W_t) assigned per worker thread.
+    std::vector<uint64_t> per_thread_pair_work;   ///< Estimated pair positions (W_t) evaluated per worker thread.
     std::vector<size_t> per_thread_units_processed; ///< Positive-work buckets/chunks processed per worker thread.
+    bool band_suppression_enabled{false};         ///< Whether band-aware duplicate suppression was active.
+    uint64_t raw_candidates_evaluated{0};         ///< Total bucket pair positions evaluated across all bands.
+    uint64_t raw_candidates_emitted{0};           ///< Total raw candidate pairs emitted before Stage 3e aggregation.
+    uint64_t suppressed_pair_count{0};            ///< Duplicate pair emissions suppressed across bands 1..7.
+    std::vector<uint64_t> per_thread_emitted_pairs;    ///< Raw candidate pairs emitted per worker thread.
+    std::vector<uint64_t> per_thread_suppressed_pairs; ///< Duplicate pairs suppressed per worker thread.
 };
 
 /**
@@ -161,6 +168,74 @@ struct PipelineResult {
  * @return uint8_t The 8-bit value of the specified band.
  */
 uint8_t extract_band(uint64_t fingerprint, size_t band_index) noexcept;
+
+/**
+ * @brief Returns the SWAR high-bit mask for all bytes strictly below `band_index` (0 <= b' < band_index).
+ *
+ * For band_index == 0, returns 0ULL.
+ * For band_index in [1, 7], sets bit (8*b' + 7) for each earlier band b' in [0, band_index - 1].
+ */
+inline constexpr uint64_t earlier_band_msb_mask(size_t band_index) noexcept {
+    if (band_index == 0) {
+        return 0ULL;
+    }
+    if (band_index >= kNumBands) {
+        return 0x8080808080808080ULL;
+    }
+    return 0x8080808080808080ULL >> (64 - band_index * 8);
+}
+
+/**
+ * @brief Branch-free O(1) SWAR zero-byte test determining whether two 64-bit fingerprints
+ *        share an identical 8-bit band value in any earlier band covered by `earlier_msb_mask`.
+ *
+ * Exactness invariant:
+ * - If all bytes below `band_index` of `xor_fp = fp_u ^ fp_v` are non-zero (>= 1), subtracting
+ *   0x01 from each byte never borrows across byte boundaries below `band_index`, and
+ *   ((byte - 1) & ~byte & 0x80) == 0 for every non-zero byte in [1, 255].
+ * - If at least one earlier byte is 0x00, the lowest-index zero byte b'_0 < band_index receives
+ *   no borrow from below, so ((0x00 - 0x01) & ~0x00) == 0xFF sets bit (8*b'_0 + 7), which is
+ *   captured by `earlier_msb_mask`.
+ */
+inline constexpr bool matched_in_earlier_band_swar_mask(
+    uint64_t fp_u,
+    uint64_t fp_v,
+    uint64_t earlier_msb_mask
+) noexcept {
+    const uint64_t xor_fp = fp_u ^ fp_v;
+    return (((xor_fp - 0x0101010101010101ULL) & ~xor_fp) & earlier_msb_mask) != 0ULL;
+}
+
+/**
+ * @brief Branch-free O(1) SWAR test determining whether two fingerprints matched in any band b' < band_index.
+ */
+inline constexpr bool matched_in_earlier_band_swar(
+    uint64_t fp_u,
+    uint64_t fp_v,
+    size_t band_index
+) noexcept {
+    if (band_index == 0) {
+        return false;
+    }
+    return matched_in_earlier_band_swar_mask(fp_u, fp_v, earlier_band_msb_mask(band_index));
+}
+
+/**
+ * @brief Reference byte-by-byte check determining whether two fingerprints matched in any band b' < band_index.
+ */
+inline bool matched_in_earlier_band_ref(
+    uint64_t fp_u,
+    uint64_t fp_v,
+    size_t band_index
+) noexcept {
+    const size_t limit = (band_index < kNumBands) ? band_index : kNumBands;
+    for (size_t b = 0; b < limit; ++b) {
+        if (extract_band(fp_u, b) == extract_band(fp_v, b)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /**
  * @brief Executes the end-to-end sequential near-duplicate detection pipeline.

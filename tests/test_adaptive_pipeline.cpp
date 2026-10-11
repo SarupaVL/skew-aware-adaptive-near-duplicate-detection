@@ -8,9 +8,11 @@
 #include <iostream>
 #include <limits>
 #include <omp.h>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 void check(bool condition, const std::string& test_name, const std::string& message) {
@@ -822,9 +824,296 @@ void test_parallel_candidate_aggregation_phase9() {
     }
 }
 
+// Phase 10: Validate SWAR zero-byte test against byte-by-byte reference across all bands and edge cases
+void test_swar_earlier_band_zero_byte_validation() {
+    // 1. Verify earlier_band_msb_mask values for all bands 0..7
+    check(earlier_band_msb_mask(0) == 0x0000000000000000ULL, "test_p10_mask_b0", "Band 0 mask must be 0.");
+    check(earlier_band_msb_mask(1) == 0x0000000000000080ULL, "test_p10_mask_b1", "Band 1 mask mismatch.");
+    check(earlier_band_msb_mask(2) == 0x0000000000008080ULL, "test_p10_mask_b2", "Band 2 mask mismatch.");
+    check(earlier_band_msb_mask(3) == 0x0000000000808080ULL, "test_p10_mask_b3", "Band 3 mask mismatch.");
+    check(earlier_band_msb_mask(4) == 0x0000000080808080ULL, "test_p10_mask_b4", "Band 4 mask mismatch.");
+    check(earlier_band_msb_mask(5) == 0x0000008080808080ULL, "test_p10_mask_b5", "Band 5 mask mismatch.");
+    check(earlier_band_msb_mask(6) == 0x0000808080808080ULL, "test_p10_mask_b6", "Band 6 mask mismatch.");
+    check(earlier_band_msb_mask(7) == 0x0080808080808080ULL, "test_p10_mask_b7", "Band 7 mask mismatch.");
+
+    // 2. Single-band match at each specific band m in [0..7]
+    const uint64_t base_fp = 0x0123456789ABCDEFULL;
+    for (size_t match_band = 0; match_band < kNumBands; ++match_band) {
+        // Construct fp_v so ONLY band `match_band` equals base_fp, and all other bands differ by 0x01, 0x7F, 0x80, or 0xFF
+        for (uint64_t diff_byte : {0x01ULL, 0x02ULL, 0x7FULL, 0x80ULL, 0x81ULL, 0xFEULL, 0xFFULL}) {
+            uint64_t xor_pattern = 0ULL;
+            for (size_t b = 0; b < kNumBands; ++b) {
+                if (b != match_band) {
+                    xor_pattern |= (diff_byte << (b * 8));
+                }
+            }
+            uint64_t fp_v = base_fp ^ xor_pattern;
+            for (size_t query_band = 0; query_band < kNumBands; ++query_band) {
+                bool swar_res = matched_in_earlier_band_swar(base_fp, fp_v, query_band);
+                bool ref_res = matched_in_earlier_band_ref(base_fp, fp_v, query_band);
+                bool expected = (match_band < query_band);
+                if (swar_res != ref_res || swar_res != expected) {
+                    check(false, "test_p10_single_band_match",
+                          "SWAR mismatch for match_band=" + std::to_string(match_band) +
+                          ", query_band=" + std::to_string(query_band));
+                }
+            }
+        }
+    }
+    check(true, "test_p10_single_band_exact_matrix", "All single-band match positions and byte diffs verified.");
+
+    // 3. Exhaustive 2-band and 3-band match subsets and borrow-propagation edge cases
+    const uint8_t edge_bytes[8] = {0x00, 0x01, 0x02, 0x7F, 0x80, 0x81, 0xFE, 0xFF};
+    for (size_t mask_bits = 0; mask_bits < 256; ++mask_bits) {
+        for (size_t non_zero_choice = 1; non_zero_choice < 8; ++non_zero_choice) {
+            uint64_t xor_val = 0ULL;
+            for (size_t b = 0; b < kNumBands; ++b) {
+                uint8_t byte_val = ((mask_bits & (size_t(1) << b)) != 0)
+                    ? uint8_t(0x00)
+                    : edge_bytes[(non_zero_choice + b) % 7 + 1];
+                xor_val |= (static_cast<uint64_t>(byte_val) << (b * 8));
+            }
+            uint64_t fp_u = 0xFEDCBA9876543210ULL;
+            uint64_t fp_v = fp_u ^ xor_val;
+            for (size_t b = 0; b < kNumBands; ++b) {
+                bool swar = matched_in_earlier_band_swar(fp_u, fp_v, b);
+                bool ref = matched_in_earlier_band_ref(fp_u, fp_v, b);
+                if (swar != ref) {
+                    check(false, "test_p10_borrow_chain_subsets",
+                          "SWAR != ref on subset mask=" + std::to_string(mask_bits) +
+                          " band=" + std::to_string(b));
+                }
+            }
+        }
+    }
+    check(true, "test_p10_exhaustive_zero_byte_subsets",
+          "All 256 zero-byte subsets and high-bit borrow-chain combinations match reference.");
+
+    // 4. 200,000 randomized 64-bit fingerprint pairs (including forced multi-byte collisions)
+    std::mt19937_64 rng(1042ULL);
+    for (size_t iter = 0; iter < 200000; ++iter) {
+        uint64_t fp_u = rng();
+        uint64_t fp_v = rng();
+        // Force random byte matches on half of iterations to exercise zero-byte borrow chains
+        if ((iter & 1) != 0) {
+            uint64_t byte_mask = rng();
+            for (size_t b = 0; b < kNumBands; ++b) {
+                if (((byte_mask >> (b * 4)) & 0x3ULL) == 0ULL) {
+                    uint64_t clear_m = ~(0xFFULL << (b * 8));
+                    fp_v = (fp_v & clear_m) | (fp_u & ~clear_m);
+                } else if (((byte_mask >> (b * 4)) & 0x3ULL) == 1ULL) {
+                    // Force 0x80 or 0x01 difference in this byte
+                    uint64_t diff = (((iter + b) & 1) != 0) ? 0x80ULL : 0x01ULL;
+                    uint64_t clear_m = ~(0xFFULL << (b * 8));
+                    uint64_t u_byte = (fp_u >> (b * 8)) & 0xFFULL;
+                    fp_v = (fp_v & clear_m) | ((u_byte ^ diff) << (b * 8));
+                }
+            }
+        }
+        for (size_t b = 0; b < kNumBands; ++b) {
+            bool swar = matched_in_earlier_band_swar(fp_u, fp_v, b);
+            bool ref = matched_in_earlier_band_ref(fp_u, fp_v, b);
+            if (swar != ref) {
+                check(false, "test_p10_randomized_swar_200k",
+                      "Randomized SWAR mismatch at iter=" + std::to_string(iter) +
+                      ", band=" + std::to_string(b));
+            }
+        }
+    }
+    check(true, "test_p10_randomized_swar_200k",
+          "200,000 randomized fingerprint pairs (1,600,000 band checks) matched byte-by-byte reference 100%.");
+}
+
+// Phase 10: Focused unit and parity tests for band-aware duplicate suppression across all pipelines
+void test_band_aware_duplicate_suppression_phase10() {
+    // 1. Empty dataset and single-document dataset with suppression enabled
+    {
+        PipelineConfig seq_cfg;
+        seq_cfg.enable_band_suppression = true;
+        PipelineResult empty_seq = run_sequential_pipeline({}, seq_cfg);
+        check(empty_seq.band_suppression_enabled &&
+              empty_seq.raw_candidates_evaluated == 0 &&
+              empty_seq.raw_candidates_emitted == 0 &&
+              empty_seq.suppressed_pair_count == 0 &&
+              empty_seq.candidate_pairs.empty(),
+              "test_p10_empty_seq", "Empty sequential pipeline with suppression must return 0 counts.");
+
+        AdaptiveConfig adap_cfg;
+        adap_cfg.enable_band_suppression = true;
+        AdaptivePipelineResult empty_adap = run_adaptive_pipeline({}, adap_cfg);
+        check(empty_adap.pipeline_result.band_suppression_enabled &&
+              empty_adap.pipeline_result.raw_candidates_evaluated == 0 &&
+              empty_adap.pipeline_result.raw_candidates_emitted == 0 &&
+              empty_adap.pipeline_result.suppressed_pair_count == 0,
+              "test_p10_empty_adap", "Empty adaptive pipeline with suppression must return 0 counts.");
+    }
+
+    // 2. Pairs shared by all 8 bands (exact duplicate cluster of 6 documents -> 15 unique pairs)
+    {
+        std::vector<Document> exact_docs;
+        for (uint64_t id = 10; id < 16; ++id) {
+            exact_docs.push_back(Document{
+                id, 1, DocumentKind::ExactCopy, 10,
+                "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima"
+            });
+        }
+        PipelineConfig base_cfg;
+        base_cfg.enable_band_suppression = false;
+        PipelineConfig supp_cfg;
+        supp_cfg.enable_band_suppression = true;
+
+        PipelineResult base_res = run_sequential_pipeline(exact_docs, base_cfg);
+        PipelineResult supp_res = run_sequential_pipeline(exact_docs, supp_cfg);
+
+        // 6 identical fingerprints share 1 bucket of size 6 in each of the 8 bands:
+        // evaluated = 8 * C(6,2) = 8 * 15 = 120.
+        // Baseline emits 120 raw pairs; suppression emits 15 (Band 0) and suppresses 105 (Bands 1..7).
+        check(base_res.raw_candidates_evaluated == 120 &&
+              base_res.raw_candidates_emitted == 120 &&
+              base_res.suppressed_pair_count == 0,
+              "test_p10_exact_cluster_baseline_counts",
+              "Baseline must evaluate and emit 120 raw pairs for 6 identical docs.");
+        check(supp_res.raw_candidates_evaluated == 120 &&
+              supp_res.raw_candidates_emitted == 15 &&
+              supp_res.suppressed_pair_count == 105,
+              "test_p10_exact_cluster_suppression_counts",
+              "Suppression must evaluate 120, emit 15 in Band 0, and suppress 105 in Bands 1..7.");
+        check(supp_res.candidate_pairs == base_res.candidate_pairs &&
+              supp_res.verified_pairs == base_res.verified_pairs &&
+              supp_res.candidate_pairs.size() == 15,
+              "test_p10_exact_cluster_parity",
+              "Suppression must preserve exact candidate and verified pairs on multi-band duplicates.");
+    }
+
+    // 3. Pairs shared by 1 band vs. multiple bands on Balanced and Skewed workloads
+    //    across Sequential, Static, Dynamic, Guided, and Adaptive (including heavy-bucket chunks)
+    for (WorkloadProfile profile : {WorkloadProfile::Balanced, WorkloadProfile::Skewed}) {
+        DatasetConfig dcfg;
+        dcfg.total_documents = 180;
+        dcfg.min_words = 30;
+        dcfg.max_words = 60;
+        dcfg.exact_duplicate_ratio = 0.25;
+        dcfg.modified_copy_ratio = 0.25;
+        dcfg.unrelated_ratio = 0.10;
+        dcfg.modification_rate = 0.10;
+        dcfg.random_seed = 42;
+        dcfg.profile = profile;
+
+        std::vector<Document> docs = generate_dataset(dcfg);
+        const std::string prof_tag = (profile == WorkloadProfile::Balanced) ? "bal" : "skew";
+
+        PipelineConfig seq_base_cfg;
+        seq_base_cfg.enable_band_suppression = false;
+        PipelineResult seq_base = run_sequential_pipeline(docs, seq_base_cfg);
+
+        PipelineConfig seq_supp_cfg;
+        seq_supp_cfg.enable_band_suppression = true;
+        PipelineResult seq_supp = run_sequential_pipeline(docs, seq_supp_cfg);
+
+        // Verify single-band and multi-band pairs are both present in the dataset
+        size_t single_band_pairs = 0;
+        size_t multi_band_pairs = 0;
+        std::unordered_map<uint64_t, uint64_t> id_to_fp;
+        for (size_t i = 0; i < seq_base.document_ids.size(); ++i) {
+            id_to_fp[seq_base.document_ids[i]] = seq_base.fingerprints[i];
+        }
+        for (const auto& cp : seq_base.candidate_pairs) {
+            uint64_t f1 = id_to_fp[cp.first];
+            uint64_t f2 = id_to_fp[cp.second];
+            size_t shared_bands = 0;
+            for (size_t b = 0; b < kNumBands; ++b) {
+                if (extract_band(f1, b) == extract_band(f2, b)) {
+                    ++shared_bands;
+                }
+            }
+            if (shared_bands == 1) ++single_band_pairs;
+            if (shared_bands >= 2) ++multi_band_pairs;
+        }
+        check(single_band_pairs > 0 && multi_band_pairs > 0,
+              "test_p10_dataset_has_single_and_multiband_" + prof_tag,
+              "Test dataset must contain both 1-band and multi-band candidate pairs.");
+
+        // Sequential suppression invariants
+        check(seq_supp.candidate_pairs == seq_base.candidate_pairs &&
+              seq_supp.verified_pairs == seq_base.verified_pairs,
+              "test_p10_seq_parity_" + prof_tag,
+              "Sequential suppression must match baseline candidate and verified pairs.");
+        check(seq_supp.raw_candidates_evaluated == seq_base.raw_candidates_evaluated &&
+              seq_supp.raw_candidates_emitted == seq_supp.candidate_pairs.size() &&
+              seq_supp.raw_candidates_emitted + seq_supp.suppressed_pair_count == seq_supp.raw_candidates_evaluated &&
+              seq_supp.suppressed_pair_count > 0,
+              "test_p10_seq_counters_" + prof_tag,
+              "Sequential suppression must emit each unique pair once and conserve evaluated = emitted + suppressed.");
+
+        // Parallel fixed policies (Static, Dynamic, Guided) and Adaptive across T = {1, 2, 4, 8}
+        for (int threads : {1, 2, 4, 8}) {
+            for (SchedulePolicy pol : {SchedulePolicy::Static, SchedulePolicy::Dynamic, SchedulePolicy::Guided}) {
+                ParallelConfig pcfg;
+                pcfg.thread_count = threads;
+                pcfg.schedule_policy = pol;
+                pcfg.enable_band_suppression = true;
+
+                PipelineResult par_supp = run_parallel_pipeline(docs, pcfg);
+                std::string label = "test_p10_par_" + std::string(to_string(pol)) + "_t" +
+                                    std::to_string(threads) + "_" + prof_tag;
+
+                uint64_t sum_work = 0;
+                uint64_t sum_emit = 0;
+                uint64_t sum_supp = 0;
+                for (uint64_t w : par_supp.per_thread_pair_work) sum_work += w;
+                for (uint64_t e : par_supp.per_thread_emitted_pairs) sum_emit += e;
+                for (uint64_t s : par_supp.per_thread_suppressed_pairs) sum_supp += s;
+
+                check(par_supp.candidate_pairs == seq_base.candidate_pairs &&
+                      par_supp.verified_pairs == seq_base.verified_pairs &&
+                      par_supp.raw_candidates_evaluated == seq_base.raw_candidates_evaluated &&
+                      par_supp.raw_candidates_emitted == seq_supp.raw_candidates_emitted &&
+                      par_supp.suppressed_pair_count == seq_supp.suppressed_pair_count &&
+                      sum_work == par_supp.raw_candidates_evaluated &&
+                      sum_emit == par_supp.raw_candidates_emitted &&
+                      sum_supp == par_supp.suppressed_pair_count,
+                      label,
+                      "Parallel fixed policy with band suppression failed parity or counter conservation.");
+            }
+
+            // Adaptive pipeline (use multiplier=1.5 and max_pair_task_size=11 to force heavy chunks across bands 0..7)
+            AdaptiveConfig acfg;
+            acfg.thread_count = threads;
+            acfg.oversized_bucket_multiplier = 1.5;
+            acfg.max_pair_task_size = 11;
+            acfg.enable_band_suppression = true;
+
+            AdaptivePipelineResult adap_supp = run_adaptive_pipeline(docs, acfg);
+            const PipelineResult& ar = adap_supp.pipeline_result;
+            std::string alabel = "test_p10_adap_t" + std::to_string(threads) + "_" + prof_tag;
+
+            assert_adaptive_matches_sequential(seq_base, adap_supp, alabel);
+
+            uint64_t sum_work = 0;
+            uint64_t sum_emit = 0;
+            uint64_t sum_supp = 0;
+            for (uint64_t w : ar.per_thread_pair_work) sum_work += w;
+            for (uint64_t e : ar.per_thread_emitted_pairs) sum_emit += e;
+            for (uint64_t s : ar.per_thread_suppressed_pairs) sum_supp += s;
+
+            check(ar.band_suppression_enabled &&
+                  adap_supp.diagnostics.band_suppression_enabled &&
+                  ar.raw_candidates_evaluated == seq_base.raw_candidates_evaluated &&
+                  ar.raw_candidates_emitted == seq_supp.raw_candidates_emitted &&
+                  ar.suppressed_pair_count == seq_supp.suppressed_pair_count &&
+                  ar.raw_candidates_emitted == ar.candidate_pairs.size() &&
+                  sum_work == ar.raw_candidates_evaluated &&
+                  sum_emit == ar.raw_candidates_emitted &&
+                  sum_supp == ar.suppressed_pair_count,
+                  alabel + "_counters",
+                  "Adaptive pipeline with band suppression failed counter conservation.");
+        }
+    }
+}
+
 int main() {
     std::cout << "=================================================================\n";
-    std::cout << " Running Phase 5 & Phase 9 Test Suite: Adaptive & Aggregation\n";
+    std::cout << " Running Phase 5, Phase 9 & Phase 10 Adaptive Pipeline Test Suite\n";
     std::cout << "=================================================================\n";
 
     test_empty_and_single_document();
@@ -838,9 +1127,11 @@ int main() {
     test_non_contiguous_and_reordered_ids();
     test_invalid_configs_and_schedule_restoration();
     test_parallel_candidate_aggregation_phase9();
+    test_swar_earlier_band_zero_byte_validation();
+    test_band_aware_duplicate_suppression_phase10();
 
     std::cout << "\n=================================================================\n";
-    std::cout << " All Phase 5 & Phase 9 Adaptive Pipeline Tests Passed!\n";
+    std::cout << " All Phase 5, Phase 9 & Phase 10 Adaptive Pipeline Tests Passed!\n";
     std::cout << "=================================================================\n";
     return 0;
 }

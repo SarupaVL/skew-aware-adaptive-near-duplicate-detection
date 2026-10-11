@@ -36,9 +36,11 @@ void print_usage(const char* prog_name) {
               << "  --reps <R>          Number of measured repetitions per configuration (default: 5)\n"
               << "  --seed <S>          Random seed for dataset generation (default: 42)\n"
               << "  --order-seed <S>    Random seed for deterministic policy order shuffling (default: 1337)\n"
-              << "  --out-dir <path>    Directory for CSV output files (default: results)\n"
-              << "  --out-prefix <name> Filename prefix for <prefix>_raw.csv and <prefix>_summary.csv\n"
-              << "  --help              Show this help message\n";
+              << "  --band-suppression         Enable opt-in band-aware duplicate suppression (Phase 10)\n"
+              << "  --compare-band-suppression Run paired in-process Baseline vs Suppression comparison (Phase 10)\n"
+              << "  --out-dir <path>           Directory for CSV output files (default: results)\n"
+              << "  --out-prefix <name>        Filename prefix for <prefix>_raw.csv and <prefix>_summary.csv\n"
+              << "  --help                     Show this help message\n";
 }
 
 } // namespace
@@ -75,6 +77,11 @@ int main(int argc, char* argv[]) {
                 suite_cfg.base_seed = std::stoull(argv[++i]);
             } else if (arg == "--order-seed" && i + 1 < argc) {
                 suite_cfg.order_seed = std::stoull(argv[++i]);
+            } else if (arg == "--band-suppression") {
+                suite_cfg.enable_band_suppression = true;
+                suite_cfg.pipeline_config.enable_band_suppression = true;
+            } else if (arg == "--compare-band-suppression") {
+                suite_cfg.compare_band_suppression = true;
             } else if (arg == "--out-dir" && i + 1 < argc) {
                 out_dir = argv[++i];
             } else if (arg == "--out-prefix" && i + 1 < argc) {
@@ -122,6 +129,11 @@ int main(int argc, char* argv[]) {
                   << " (ModRate=" << suite_cfg.modification_rate << ")\n";
         std::cout << " SimHash Parameters   : ShingleSize=" << suite_cfg.pipeline_config.shingle_size
                   << ", MaxHammingThreshold=" << suite_cfg.pipeline_config.max_hamming_threshold << "\n";
+        std::cout << " Band Suppression     : "
+                  << (suite_cfg.compare_band_suppression
+                          ? "PAIRED IN-PROCESS (Baseline vs Suppression)"
+                          : (suite_cfg.enable_band_suppression ? "ENABLED" : "DISABLED (baseline)"))
+                  << "\n";
         std::cout << " Adaptive Defaults    : cv_threshold=" << suite_cfg.cv_threshold
                   << ", oversized_mult=" << suite_cfg.oversized_bucket_multiplier
                   << ", max_pair_task_size=" << suite_cfg.max_pair_task_size << "\n";

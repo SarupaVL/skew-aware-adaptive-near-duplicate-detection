@@ -519,6 +519,10 @@ ctest --test-dir build-release --output-on-failure
 # Writes results/benchmark_raw.csv and results/benchmark_summary.csv
 .\build-release\hpc_benchmark.exe --sizes 500,1000,2000,4000,8000 --warmup 1 --reps 5
 
+# Optional: Enable band-aware candidate suppression (--band-suppression) or paired in-process comparison (--compare-band-suppression)
+.\build-release\hpc_benchmark.exe --sizes 500,1000,2000,4000,8000 --warmup 1 --reps 5 --band-suppression
+.\build-release\hpc_benchmark.exe --sizes 500,1000,2000,4000,8000 --warmup 1 --reps 5 --compare-band-suppression --out-prefix phase10_full_paired
+
 # Regenerate all PNG performance and load-balance plots in results/
 python scripts/plot_benchmarks.py
 ```

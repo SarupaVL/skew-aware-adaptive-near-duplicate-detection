@@ -47,6 +47,7 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
     auto pipeline_start = SteadyClock::now();
 
     PipelineResult result;
+    result.band_suppression_enabled = config.enable_band_suppression;
     size_t num_docs = documents.size();
     result.document_ids.resize(num_docs);
     result.fingerprints.resize(num_docs);
@@ -55,6 +56,8 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
         result.actual_thread_count = 1;
         result.per_thread_pair_work = {0ULL};
         result.per_thread_units_processed = {0};
+        result.per_thread_emitted_pairs = {0ULL};
+        result.per_thread_suppressed_pairs = {0ULL};
         auto pipeline_end = SteadyClock::now();
         result.timings.total_pipeline_ms = elapsed_ms(pipeline_start, pipeline_end);
         return result;
@@ -103,14 +106,28 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
     // 8 bands, each with 256 buckets (possible values 0..255).
     // buckets_table[band][value] stores the list of document IDs mapped to that bucket.
     std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_table;
+    std::array<std::array<std::vector<uint64_t>, 256>, kNumBands> buckets_fp_table;
 
-    for (size_t i = 0; i < num_docs; ++i) {
-        uint64_t doc_id = result.document_ids[i];
-        uint64_t fp = result.fingerprints[i];
+    if (!config.enable_band_suppression) {
+        for (size_t i = 0; i < num_docs; ++i) {
+            uint64_t doc_id = result.document_ids[i];
+            uint64_t fp = result.fingerprints[i];
 
-        for (size_t band = 0; band < kNumBands; ++band) {
-            uint8_t val = extract_band(fp, band);
-            buckets_table[band][val].push_back(doc_id);
+            for (size_t band = 0; band < kNumBands; ++band) {
+                uint8_t val = extract_band(fp, band);
+                buckets_table[band][val].push_back(doc_id);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < num_docs; ++i) {
+            uint64_t doc_id = result.document_ids[i];
+            uint64_t fp = result.fingerprints[i];
+
+            for (size_t band = 0; band < kNumBands; ++band) {
+                uint8_t val = extract_band(fp, band);
+                buckets_table[band][val].push_back(doc_id);
+                buckets_fp_table[band][val].push_back(fp);
+            }
         }
     }
 
@@ -193,33 +210,88 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
 
     std::vector<CandidatePair> raw_candidates;
     size_t units_processed = 0;
+    uint64_t evaluated_pairs = 0;
+    uint64_t suppressed_pairs = 0;
 
-    for (size_t band = 0; band < kNumBands; ++band) {
-        for (size_t val = 0; val < 256; ++val) {
-            const auto& bucket_docs = buckets_table[band][val];
-            if (bucket_docs.size() < 2) {
-                continue;
+    if (!config.enable_band_suppression) {
+        for (size_t band = 0; band < kNumBands; ++band) {
+            for (size_t val = 0; val < 256; ++val) {
+                const auto& bucket_docs = buckets_table[band][val];
+                if (bucket_docs.size() < 2) {
+                    continue;
+                }
+                ++units_processed;
+
+                // Generate all unordered pairs within this bucket
+                for (size_t i = 0; i < bucket_docs.size(); ++i) {
+                    for (size_t j = i + 1; j < bucket_docs.size(); ++j) {
+                        uint64_t u = bucket_docs[i];
+                        uint64_t v = bucket_docs[j];
+                        if (u != v) {
+                            // Normalize pair so smaller ID comes first
+                            CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                            raw_candidates.push_back(pair);
+                        }
+                    }
+                }
             }
-            ++units_processed;
+        }
+        evaluated_pairs = static_cast<uint64_t>(raw_candidates.size());
+    } else {
+        for (size_t band = 0; band < kNumBands; ++band) {
+            const uint64_t earlier_mask = earlier_band_msb_mask(band);
+            for (size_t val = 0; val < 256; ++val) {
+                const auto& bucket_docs = buckets_table[band][val];
+                const size_t k = bucket_docs.size();
+                if (k < 2) {
+                    continue;
+                }
+                ++units_processed;
 
-            // Generate all unordered pairs within this bucket
-            for (size_t i = 0; i < bucket_docs.size(); ++i) {
-                for (size_t j = i + 1; j < bucket_docs.size(); ++j) {
-                    uint64_t u = bucket_docs[i];
-                    uint64_t v = bucket_docs[j];
-                    if (u != v) {
-                        // Normalize pair so smaller ID comes first
-                        CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
-                        raw_candidates.push_back(pair);
+                if (band == 0) {
+                    for (size_t i = 0; i < k; ++i) {
+                        uint64_t u = bucket_docs[i];
+                        for (size_t j = i + 1; j < k; ++j) {
+                            ++evaluated_pairs;
+                            uint64_t v = bucket_docs[j];
+                            if (u != v) {
+                                CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                raw_candidates.push_back(pair);
+                            }
+                        }
+                    }
+                } else {
+                    const auto& bucket_fps = buckets_fp_table[band][val];
+                    for (size_t i = 0; i < k; ++i) {
+                        uint64_t u = bucket_docs[i];
+                        uint64_t fp_u = bucket_fps[i];
+                        for (size_t j = i + 1; j < k; ++j) {
+                            ++evaluated_pairs;
+                            if (matched_in_earlier_band_swar_mask(fp_u, bucket_fps[j], earlier_mask)) {
+                                ++suppressed_pairs;
+                                continue;
+                            }
+                            uint64_t v = bucket_docs[j];
+                            if (u != v) {
+                                CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
+                                raw_candidates.push_back(pair);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
+    const uint64_t emitted_pairs = static_cast<uint64_t>(raw_candidates.size());
     result.actual_thread_count = 1;
-    result.per_thread_pair_work = {static_cast<uint64_t>(raw_candidates.size())};
+    result.raw_candidates_evaluated = evaluated_pairs;
+    result.raw_candidates_emitted = emitted_pairs;
+    result.suppressed_pair_count = suppressed_pairs;
+    result.per_thread_pair_work = {evaluated_pairs};
     result.per_thread_units_processed = {units_processed};
+    result.per_thread_emitted_pairs = {emitted_pairs};
+    result.per_thread_suppressed_pairs = {suppressed_pairs};
 
     // Sort and deduplicate candidate pairs deterministically
     std::sort(raw_candidates.begin(), raw_candidates.end());

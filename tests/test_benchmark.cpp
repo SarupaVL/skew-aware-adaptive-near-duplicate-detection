@@ -325,11 +325,119 @@ void test_phase7_execution_order_and_timing_reliability() {
     }
 }
 
+void test_phase10_band_suppression_benchmark_comparison() {
+    BenchmarkSuiteConfig base_cfg;
+    base_cfg.dataset_sizes = {80};
+    base_cfg.profiles = {WorkloadProfile::Balanced, WorkloadProfile::Skewed};
+    base_cfg.thread_counts = {1, 2, 4};
+    base_cfg.warmup_runs = 1;
+    base_cfg.measured_runs = 2;
+    base_cfg.base_seed = 42ULL;
+    base_cfg.order_seed = 1337ULL;
+    base_cfg.enable_band_suppression = false;
+
+    BenchmarkSuiteConfig supp_cfg = base_cfg;
+    supp_cfg.enable_band_suppression = true;
+    supp_cfg.pipeline_config.enable_band_suppression = true;
+
+    BenchmarkSuiteResult base_res = run_benchmark_suite(base_cfg, nullptr);
+    BenchmarkSuiteResult supp_res = run_benchmark_suite(supp_cfg, nullptr);
+
+    check(base_res.summary_rows.size() == supp_res.summary_rows.size(),
+          "test_p10_bench_summary_size", "Baseline and suppression suites must produce identical row counts.");
+
+    for (size_t i = 0; i < base_res.summary_rows.size(); ++i) {
+        const auto& b = base_res.summary_rows[i];
+        const auto& s = supp_res.summary_rows[i];
+
+        check(!b.band_suppression_enabled && s.band_suppression_enabled,
+              "test_p10_bench_flag_recorded", "Summary rows must record band_suppression_enabled flag.");
+        check(b.parity_all_passed && s.parity_all_passed,
+              "test_p10_bench_parity_passed", "All baseline and suppression benchmark runs must pass parity.");
+        check(b.candidate_pairs_count == s.candidate_pairs_count &&
+              b.verified_pairs_count == s.verified_pairs_count &&
+              b.raw_candidates_evaluated == s.raw_candidates_evaluated &&
+              b.total_estimated_pair_work == s.raw_candidates_evaluated,
+              "test_p10_bench_exact_count_parity",
+              "Evaluated, unique candidate, and verified pair counts must match identically.");
+        check(b.raw_candidates_emitted == b.raw_candidates_evaluated && b.suppressed_pair_count == 0,
+              "test_p10_bench_base_emits_all",
+              "Baseline must emit all evaluated pairs with 0 suppressed.");
+        check(s.raw_candidates_emitted == s.candidate_pairs_count &&
+              s.raw_candidates_emitted + s.suppressed_pair_count == s.raw_candidates_evaluated &&
+              s.suppressed_pair_count > 0,
+              "test_p10_bench_supp_emits_unique_only",
+              "Suppression must emit only unique pairs and conserve evaluated = emitted + suppressed.");
+    }
+
+    std::ostringstream raw_csv;
+    write_raw_csv(raw_csv, supp_res.raw_samples);
+    check(raw_csv.str().find("band_suppression_enabled,raw_candidates_evaluated,raw_candidates_emitted,suppressed_pair_count") != std::string::npos,
+          "test_p10_raw_csv_columns", "Raw CSV must include Phase 10 suppression columns.");
+
+    std::ostringstream sum_csv;
+    write_summary_csv(sum_csv, supp_res.summary_rows);
+    check(sum_csv.str().find("band_suppression_enabled,raw_candidates_evaluated,raw_candidates_emitted,suppressed_pair_count") != std::string::npos,
+          "test_p10_summary_csv_columns", "Summary CSV must include Phase 10 suppression columns.");
+
+    // Verify paired in-process comparison mode (generate_paired_config_order + compare_band_suppression)
+    const std::vector<int> threads = {1, 2, 4};
+    const std::vector<BenchmarkConfigSpec> base_specs = build_dataset_config_specs(threads); // 13 specs
+    auto paired_r0 = generate_paired_config_order(base_specs, 1337ULL, 80, WorkloadProfile::Skewed, 0);
+    auto paired_r1 = generate_paired_config_order(base_specs, 1337ULL, 80, WorkloadProfile::Skewed, 1);
+
+    check(paired_r0.size() == 2 * base_specs.size(),
+          "test_p10_paired_order_size", "Paired config order must have exactly 2x base_specs entries.");
+
+    for (size_t k = 0; k < base_specs.size(); ++k) {
+        const auto& first0 = paired_r0[2 * k];
+        const auto& second0 = paired_r0[2 * k + 1];
+        check(first0.policy == second0.policy && first0.thread_count == second0.thread_count &&
+              first0.enable_band_suppression != second0.enable_band_suppression,
+              "test_p10_paired_adjacent_variants",
+              "Each adjacent pair in paired_r0 must have identical (policy, threads) and opposite suppression flags.");
+
+        bool expected_first_supp_r0 = (((0 + k) & 1ULL) == 1ULL);
+        bool expected_first_supp_r1 = (((1 + k) & 1ULL) == 1ULL);
+        check(first0.enable_band_suppression == expected_first_supp_r0,
+              "test_p10_paired_alternation_r0", "Round 0 rank alternation mismatch.");
+        check(paired_r1[2 * k].enable_band_suppression == expected_first_supp_r1,
+              "test_p10_paired_alternation_r1", "Round 1 rank alternation mismatch.");
+    }
+
+    BenchmarkSuiteConfig paired_cfg = base_cfg;
+    paired_cfg.compare_band_suppression = true;
+    BenchmarkSuiteResult paired_res = run_benchmark_suite(paired_cfg, nullptr);
+
+    check(paired_res.summary_rows.size() == 2 * base_res.summary_rows.size(),
+          "test_p10_paired_suite_summary_size", "Paired suite must produce 2x summary rows (Baseline + Suppression).");
+    check(paired_res.raw_samples.size() == 2 * base_res.raw_samples.size(),
+          "test_p10_paired_suite_raw_size", "Paired suite must produce 2x raw sample rows.");
+
+    for (size_t k = 0; k < base_res.summary_rows.size(); ++k) {
+        const auto& pb = paired_res.summary_rows[2 * k];
+        const auto& ps = paired_res.summary_rows[2 * k + 1];
+        check(!pb.band_suppression_enabled && ps.band_suppression_enabled,
+              "test_p10_paired_summary_order", "Summary rows must alternate (Baseline, Suppression) per canonical spec.");
+        check(pb.policy == ps.policy && pb.configured_threads == ps.configured_threads &&
+              pb.dataset_size == ps.dataset_size && pb.profile == ps.profile,
+              "test_p10_paired_summary_spec_match", "Paired summary rows must share dataset, profile, policy, and threads.");
+        check(pb.parity_all_passed && ps.parity_all_passed &&
+              pb.candidate_pairs_count == ps.candidate_pairs_count &&
+              pb.verified_pairs_count == ps.verified_pairs_count &&
+              pb.raw_candidates_evaluated == ps.raw_candidates_evaluated &&
+              ps.raw_candidates_emitted == ps.candidate_pairs_count &&
+              ps.raw_candidates_emitted + ps.suppressed_pair_count == ps.raw_candidates_evaluated,
+              "test_p10_paired_summary_exact_parity",
+              "Paired in-process runs must pass parity and conserve candidate counts.");
+    }
+}
+
 } // namespace
 
 int main() {
     std::cout << "========================================================\n";
-    std::cout << " Running Phase 6 & Phase 7 Benchmark Unit Tests\n";
+    std::cout << " Running Phase 6, Phase 7 & Phase 10 Benchmark Unit Tests\n";
     std::cout << "========================================================\n";
 
     test_statistical_helpers();
@@ -337,9 +445,10 @@ int main() {
     test_parity_verification_and_instrumentation();
     test_mini_benchmark_suite_and_csv_export();
     test_phase7_execution_order_and_timing_reliability();
+    test_phase10_band_suppression_benchmark_comparison();
 
     std::cout << "========================================================\n";
-    std::cout << " All Phase 6 & Phase 7 Benchmark Tests PASSED!\n";
+    std::cout << " All Phase 6, Phase 7 & Phase 10 Benchmark Tests PASSED!\n";
     std::cout << "========================================================\n";
     return 0;
 }
