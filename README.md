@@ -6,13 +6,14 @@ This project investigates CPU-based near-duplicate document detection using SimH
 
 ---
 
-## Current Status: Phase 1 Completed
+## Current Status: Phase 2 Completed
 
 The project has completed:
 - **Phase 0:** Environment inspection, C++17 validation, and OpenMP runtime verification.
-- **Phase 1:** In-memory document data model, ground-truth duplicate cluster semantics, and a deterministic synthetic dataset generator with balanced and skewed workload profiles.
+- **Phase 1:** In-memory document data model, ground-truth duplicate cluster semantics, and deterministic synthetic dataset generator.
+- **Phase 2:** 64-bit SimHash locality-sensitive fingerprinting, deterministic FNV-1a hashing, token shingling, and bitwise Hamming distance computation.
 
-*(Subsequent components—SimHash fingerprinting, candidate band indexing, and parallel OpenMP schedulers—are part of future phases and are not yet implemented.)*
+*(Subsequent components—candidate band indexing, duplicate pair verification, and OpenMP parallel loop schedulers—are part of future phases and are not yet implemented.)*
 
 ---
 
@@ -55,10 +56,41 @@ The generator (`include/dataset_generator.hpp`, `src/dataset_generator.cpp`) pro
 
 > [!NOTE]
 > **Important Distinction on Workload Scope:**  
-> In Phase 1, the `Balanced` and `Skewed` profiles govern strictly the distribution and sizes of **ground-truth duplicate groups**. They do **not** dictate the downstream SimHash candidate bucket distribution. The actual bucket workloads and pairwise candidate comparison counts will be experimentally measured once SimHash fingerprinting and candidate band generation are implemented in subsequent phases.
+> In Phase 1 and 2, the `Balanced` and `Skewed` profiles govern strictly the distribution and sizes of **ground-truth duplicate groups**. They do **not** dictate the downstream SimHash candidate bucket distribution. The actual bucket workloads and pairwise candidate comparison counts will be experimentally measured once candidate band generation is implemented in Phase 3.
 
-### Deterministic Reproducibility
-The generator uses `std::mt19937_64` initialized with `random_seed`. For identical configurations and seeds, it produces bitwise-identical documents, texts, IDs, and ground-truth group assignments.
+---
+
+## SimHash Fingerprinting & Hamming Distance (Phase 2)
+
+The SimHash module (`include/simhash.hpp`, `src/simhash.cpp`) transforms variable-length document text into a compact 64-bit fingerprint that preserves cosine similarity in Hamming space.
+
+### 1. Tokenization & Normalization
+- Text is tokenized by separating contiguous non-whitespace character sequences.
+- Leading, trailing, and repeated whitespace (spaces, tabs, newlines, carriage returns) are cleanly ignored.
+
+### 2. Token Shingling (Word $k$-grams)
+- Consecutive tokens are grouped into overlapping windows of size $k$ (default: `kDefaultShingleSize = 3`).
+- For example, tokens `[w0, w1, w2, w3]` produce shingles `["w0 w1 w2", "w1 w2 w3"]`.
+- **Short-document handling:** If a document contains fewer tokens than $k$, all available tokens are joined into a single fallback shingle so the document still receives a valid fingerprint.
+
+### 3. Deterministic 64-bit Hashing (FNV-1a)
+- Each shingle is hashed into a 64-bit unsigned integer using the **FNV-1a** algorithm (`fnv1a_hash64`):
+  $$\text{hash} = (\text{hash} \oplus \text{byte}) \times 1099511628211ULL$$
+  starting from offset basis `14695981039346656037ULL`.
+- Unlike `std::hash` (which is implementation-defined and varies across standard libraries), FNV-1a is strictly platform-independent and deterministic across compilers and runs.
+
+### 4. Weighted Bit Voting
+- An array of 64 signed accumulators `V[0..63]` is initialized to zero.
+- For each shingle hash $H$:
+  - If bit $i$ of $H$ is 1, $V[i] \mathrel{+}= 1$ (positive vote).
+  - If bit $i$ of $H$ is 0, $V[i] \mathrel{-}= 1$ (negative vote).
+- The final 64-bit fingerprint sets bit $i = 1$ if $V[i] > 0$, else $0$.
+- **Empty-document handling:** Empty or whitespace-only documents deterministically return `0ULL`.
+
+### 5. Bitwise Hamming Distance
+- `hamming_distance(a, b)` computes the number of differing bit positions between two 64-bit fingerprints using bitwise XOR and hardware population count:
+  $$\text{dist}(a, b) = \text{popcount}(a \oplus b)$$
+- Output ranges from `0` (identical) to `64` (completely inverted).
 
 ---
 
@@ -102,11 +134,12 @@ cmake --build build-release
 
 ### 4. Run Automated Tests
 ```powershell
-# Run the test executable directly
-.\build\test_dataset_generator.exe
-
-# Or via CTest
+# Run via CTest
 ctest --test-dir build --output-on-failure
+
+# Or run individual test suites directly
+.\build\test_dataset_generator.exe
+.\build\test_simhash.exe
 ```
 
 ### 5. Run the Demonstration Program
@@ -139,33 +172,35 @@ ctest --test-dir build --output-on-failure
 ---------------------------------------------------------
  Synthetic Dataset Summary
 ---------------------------------------------------------
-  Total Documents          : 100
-  Original Documents       : 40
-  Exact Copies             : 25
-  Modified Copies          : 25
-  Unrelated Singletons     : 10
-  Total Ground-Truth Groups: 50
-  Duplicate Groups (size>1): 40
-  Max Group Size           : 3
+  Total Documents          : 20
+  Original Documents       : 10
+  Exact Copies             : 4
+  Modified Copies          : 4
+  Unrelated Singletons     : 2
+  Total Ground-Truth Groups: 12
+  Duplicate Groups (size>1): 8
+  Max Group Size           : 2
   Min Group Size           : 1
   Workload Profile         : Balanced
   Random Seed              : 42
 ---------------------------------------------------------
----------------------------------------------------------
- Synthetic Dataset Summary
----------------------------------------------------------
-  Total Documents          : 100
-  Original Documents       : 40
-  Exact Copies             : 25
-  Modified Copies          : 25
-  Unrelated Singletons     : 10
-  Total Ground-Truth Groups: 50
-  Duplicate Groups (size>1): 9
-  Max Group Size           : 31
-  Min Group Size           : 1
-  Workload Profile         : Skewed
-  Random Seed              : 42
----------------------------------------------------------
 
-[Status] Phase 1 execution completed successfully.
+[Phase 2 Demonstration: SimHash Fingerprints]
+Fingerprinting sample documents from generated dataset:
+----------------------------------------------------------------------------------
+ ID | Group | Kind          | 64-bit Hex Fingerprint | First 5 Words
+----------------------------------------------------------------------------------
+  0 |     1 | Original      | 0xda1259ecf93661af | pipeline resource cost strategy compiler...
+  1 |     2 | Original      | 0x31b02534f0417760 | metric iteration pool library locality...
+  2 |     3 | Original      | 0xa12f079bef003d1a | overhead multithreaded parallel buffer integer...
+  3 |     4 | Original      | 0x7cf573ba9985b85a | load capacity speedup segment strategy...
+  4 |     5 | Original      | 0x8fe3078803e5b1a5 | pipeline buffer multicore index response...
+  5 |     6 | Original      | 0xfcb106c6bb73dad4 | deterministic database deadlock database contention...
+  6 |     7 | Original      | 0xbe0eaf93a427e173 | library performance structure random flow...
+  7 |     8 | Original      | 0xc624cb293bb30460 | random data timer computation data...
+----------------------------------------------------------------------------------
+
+Sample Hamming distance between Document 0 (Original) and Document 10 (ExactCopy): 0 bits differing
+
+[Status] Execution completed successfully.
 ```

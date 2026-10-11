@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(SkewAwareNearDuplicateDetection
-    VERSION 0.1.0
+    VERSION 0.2.0
     LANGUAGES CXX
 )
 
@@ -24,16 +24,17 @@ endif()
 # Common include directories
 include_directories(include)
 
-# Reusable core library for data model and dataset generator
+# Reusable core library (data model, dataset generator, SimHash fingerprinting)
 add_library(hpc_core STATIC
     src/dataset_generator.cpp
+    src/simhash.cpp
 )
 
 target_include_directories(hpc_core PUBLIC
     include
 )
 
-# Main executable (demonstrates Phase 0 OpenMP checks + Phase 1 dataset generator)
+# Main executable (demonstrates Phase 0 OpenMP checks + Phase 1 dataset generator + Phase 2 SimHash)
 add_executable(hpc_near_duplicate
     src/main.cpp
 )
@@ -44,9 +45,10 @@ target_link_libraries(hpc_near_duplicate
         OpenMP::OpenMP_CXX
 )
 
-# Automated test suite for Phase 1
+# Automated testing
 enable_testing()
 
+# Test 1: Dataset Generator Test Suite (Phase 1)
 add_executable(test_dataset_generator
     tests/test_generator.cpp
 )
@@ -57,3 +59,15 @@ target_link_libraries(test_dataset_generator
 )
 
 add_test(NAME DatasetGeneratorTest COMMAND test_dataset_generator)
+
+# Test 2: SimHash & Hamming Distance Test Suite (Phase 2)
+add_executable(test_simhash
+    tests/test_simhash.cpp
+)
+
+target_link_libraries(test_simhash
+    PRIVATE
+        hpc_core
+)
+
+add_test(NAME SimHashTest COMMAND test_simhash)

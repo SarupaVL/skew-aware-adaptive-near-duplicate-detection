@@ -1,4 +1,6 @@
 #include "dataset_generator.hpp"
+#include "simhash.hpp"
+#include <iomanip>
 #include <iostream>
 #include <omp.h>
 
@@ -50,30 +52,69 @@ int main() {
     // -------------------------------------------------------------
     std::cout << "[Phase 1 Demonstration: Dataset Generation]\n";
 
-    // 1. Generate a Balanced Dataset
     DatasetConfig balanced_cfg;
-    balanced_cfg.total_documents = 100;
-    balanced_cfg.min_words = 30;
-    balanced_cfg.max_words = 60;
-    balanced_cfg.exact_duplicate_ratio = 0.25;
-    balanced_cfg.modified_copy_ratio = 0.25;
+    balanced_cfg.total_documents = 20;
+    balanced_cfg.min_words = 25;
+    balanced_cfg.max_words = 50;
+    balanced_cfg.exact_duplicate_ratio = 0.20;
+    balanced_cfg.modified_copy_ratio = 0.20;
     balanced_cfg.unrelated_ratio = 0.10;
     balanced_cfg.modification_rate = 0.15;
     balanced_cfg.random_seed = 42;
     balanced_cfg.profile = WorkloadProfile::Balanced;
 
-    std::vector<Document> balanced_dataset = generate_dataset(balanced_cfg);
-    DatasetSummary balanced_summary = summarize_dataset(balanced_dataset, balanced_cfg);
-    balanced_summary.print(std::cout);
+    std::vector<Document> dataset = generate_dataset(balanced_cfg);
+    DatasetSummary summary = summarize_dataset(dataset, balanced_cfg);
+    summary.print(std::cout);
 
-    // 2. Generate a Skewed Dataset (same seed, skewed distribution)
-    DatasetConfig skewed_cfg = balanced_cfg;
-    skewed_cfg.profile = WorkloadProfile::Skewed;
+    // -------------------------------------------------------------
+    // Phase 2 Demonstration: SimHash Fingerprinting & Hamming Distance
+    // -------------------------------------------------------------
+    std::cout << "\n[Phase 2 Demonstration: SimHash Fingerprints]\n";
+    std::cout << "Fingerprinting sample documents from generated dataset:\n";
+    std::cout << "----------------------------------------------------------------------------------\n";
+    std::cout << " ID | Group | Kind          | 64-bit Hex Fingerprint | First 5 Words\n";
+    std::cout << "----------------------------------------------------------------------------------\n";
 
-    std::vector<Document> skewed_dataset = generate_dataset(skewed_cfg);
-    DatasetSummary skewed_summary = summarize_dataset(skewed_dataset, skewed_cfg);
-    skewed_summary.print(std::cout);
+    // Fingerprint first 8 documents as a simple demonstration
+    size_t demo_count = std::min<size_t>(dataset.size(), 8);
+    std::vector<uint64_t> sample_fingerprints;
+    sample_fingerprints.reserve(demo_count);
 
-    std::cout << "\n[Status] Phase 1 execution completed successfully.\n";
+    for (size_t i = 0; i < demo_count; ++i) {
+        const auto& doc = dataset[i];
+        uint64_t fp = compute_simhash(doc.text);
+        sample_fingerprints.push_back(fp);
+
+        // Extract first 5 words for preview
+        auto tokens = tokenize_text(doc.text);
+        std::string preview;
+        for (size_t t = 0; t < std::min<size_t>(tokens.size(), 5); ++t) {
+            if (t > 0) preview += ' ';
+            preview += tokens[t];
+        }
+        if (tokens.size() > 5) preview += "...";
+
+        std::cout << " " << std::setw(2) << doc.id << " | "
+                  << std::setw(5) << doc.group_id << " | "
+                  << std::setw(13) << std::left << to_string(doc.kind) << std::right << " | "
+                  << "0x" << std::hex << std::setw(16) << std::setfill('0') << fp
+                  << std::dec << std::setfill(' ') << " | "
+                  << preview << "\n";
+    }
+    std::cout << "----------------------------------------------------------------------------------\n";
+
+    // Show a sample pairwise Hamming distance check between document 0 and an exact copy if present
+    for (size_t i = 1; i < demo_count; ++i) {
+        if (dataset[i].source_id == static_cast<int64_t>(dataset[0].id)) {
+            int dist = hamming_distance(sample_fingerprints[0], sample_fingerprints[i]);
+            std::cout << "\nSample Hamming distance between Document 0 (Original) and Document "
+                      << dataset[i].id << " (" << to_string(dataset[i].kind) << "): "
+                      << dist << " bits differing\n";
+            break;
+        }
+    }
+
+    std::cout << "\n[Status] Execution completed successfully.\n";
     return 0;
 }
