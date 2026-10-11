@@ -165,17 +165,17 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
 ### 2. Parallelized vs. Sequential Stages
 - **Fingerprinting (Parallel):** Preallocated vector storage `result.fingerprints[num_docs]`. Each OpenMP thread computes SimHash for its assigned document partition and writes directly to its disjoint output index without synchronization locks.
 - **Bucket Construction & Workload Statistics (Sequential):** Kept sequential. Since there are only $8 \times 256 = 2048$ bucket slots, sequential table grouping runs in $< 0.2$ ms and completely avoids hash table lock contention or atomic insertion overhead.
-- **Candidate Generation (Parallel):** Parallel loop iterates over active buckets ($k_i \ge 2$). To avoid critical section contention, each thread accumulates candidate pairs into thread-local storage (`tl_candidates[tid]`). After the parallel region, thread-local vectors are merged, sorted lexicographically, and deduplicated via `std::unique`.
-- **Hamming-Distance Verification (Parallel):** Parallel loop distributes deduplicated candidate pairs across threads. Matching pairs are recorded in thread-local storage (`tl_verified[tid]`), merged, and sorted lexicographically after the parallel region.
+- **Candidate Generation (Parallel):** Parallel loop iterates over active buckets ($k_i \ge 2$). To avoid critical section contention, each thread accumulates candidate pairs into dedicated per-thread buffer slots (`per_thread_candidates[tid]`) in a heap-allocated `std::vector` (indexed by thread ID, avoiding C++ `thread_local` storage duration overhead). After the parallel region, per-thread vectors are merged, sorted lexicographically, and deduplicated via `std::unique`.
+- **Hamming-Distance Verification (Parallel):** Parallel loop distributes deduplicated candidate pairs across threads. Matching pairs are recorded in per-thread buffer slots (`per_thread_verified[tid]`), merged, and sorted lexicographically after the parallel region.
 
 ### 3. OpenMP Scheduling Policies Supported
 - **`Static` Scheduling:** Work iterations divided evenly into contiguous chunks across threads before execution. Minimizes scheduling overhead, but sensitive to load imbalance under skewed bucket workloads.
-- **`Dynamic` Scheduling:** Work divided into chunks of size `chunk_size` and assigned to idle threads dynamically from a shared work queue. Mitigates load imbalance at the cost of runtime synchronization.
-- **`Guided` Scheduling:** Chunks start large and decrease exponentially down to `chunk_size`, balancing runtime synchronization overhead with dynamic load balancing.
-- **RAII Schedule Safety:** An RAII guard (`OmpScheduleGuard`) sets `omp_set_schedule()` during execution and restores prior runtime settings upon exit, preventing scheduler state leaks.
+- **`Dynamic` Scheduling:** Work divided into chunks of size `chunk_size` (0 = OpenMP default of 1) and assigned to idle threads dynamically from a shared work queue. Mitigates load imbalance at the cost of runtime synchronization.
+- **`Guided` Scheduling:** Chunks start large and decrease exponentially down to `chunk_size` (0 = OpenMP default of 1), balancing runtime synchronization overhead with dynamic load balancing.
+- **RAII Schedule Safety:** An RAII guard (`OmpScheduleGuard`) records prior OpenMP runtime schedule settings via `omp_get_schedule()`, applies the requested policy and chunk size via `omp_set_schedule()`, and restores the prior configuration on both normal return and exception unwinding, completely preventing scheduler state leaks.
 
 ### 4. Deterministic Output Guarantee
-Because thread-local accumulation orders depend on dynamic thread scheduling, both candidate pairs and verified pairs are sorted lexicographically (`std::sort`) after parallel accumulation. **As a result, parallel execution produces bitwise-identical fingerprints, candidate pairs, verified pairs, and workload statistics to the sequential reference implementation across all thread counts and scheduling policies.**
+Because per-thread accumulation orders depend on dynamic thread scheduling, both candidate pairs and verified pairs are sorted lexicographically (`std::sort`) after parallel accumulation. **As a result, parallel execution produces bitwise-identical fingerprints, candidate pairs, verified pairs, and workload statistics to the sequential reference implementation across all thread counts and scheduling policies.**
 
 > [!NOTE]
 > **Performance Note on Small Workloads:**  

@@ -2,6 +2,7 @@
 #define PARALLEL_PIPELINE_HPP
 
 #include "candidate_gen.hpp"
+#include <omp.h>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -27,6 +28,30 @@ inline const char* to_string(SchedulePolicy policy) {
     }
 }
 
+namespace detail {
+
+/**
+ * @brief RAII guard to safely set and restore OpenMP runtime loop schedule.
+ *
+ * When using `schedule(runtime)`, OpenMP reads the schedule set by `omp_set_schedule()`.
+ * This guard records the prior schedule and restores it upon scope exit (normal return
+ * or exception unwinding), preventing schedule configuration from leaking into unrelated work.
+ */
+struct OmpScheduleGuard {
+    omp_sched_t orig_sched{omp_sched_static};
+    int orig_modifier{0};
+
+    OmpScheduleGuard(SchedulePolicy policy, int chunk_size);
+    ~OmpScheduleGuard();
+
+    OmpScheduleGuard(const OmpScheduleGuard&) = delete;
+    OmpScheduleGuard& operator=(const OmpScheduleGuard&) = delete;
+    OmpScheduleGuard(OmpScheduleGuard&&) = delete;
+    OmpScheduleGuard& operator=(OmpScheduleGuard&&) = delete;
+};
+
+} // namespace detail
+
 /**
  * @brief Configuration parameters for OpenMP parallel pipeline execution.
  */
@@ -47,10 +72,11 @@ struct ParallelConfig {
  *
  * Parallelized Stages:
  * 1. Fingerprinting: Parallel loop over documents writing to disjoint preallocated indices.
- * 2. Candidate Generation: Parallel loop over candidate buckets using thread-local pair
- *    accumulation, merged and lexicographically sorted/deduplicated after parallel region.
+ * 2. Candidate Generation: Parallel loop over candidate buckets using per-thread buffer slots
+ *    in a std::vector (indexed by thread ID, avoiding TLS overhead), merged and lexicographically
+ *    sorted/deduplicated after parallel region.
  * 3. Verification: Parallel loop over deduplicated candidate pairs evaluating bitwise Hamming
- *    distance using thread-local pair accumulation, merged and sorted after parallel region.
+ *    distance using per-thread buffer slots, merged and sorted after parallel region.
  *
  * Sequential Stages:
  * - Bucket construction (cheap and race-free for 8 bands x 256 buckets).

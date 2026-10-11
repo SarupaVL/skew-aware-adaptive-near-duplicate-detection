@@ -24,44 +24,45 @@ void ParallelConfig::validate() const {
             std::to_string(chunk_size) + ")."
         );
     }
+    if (schedule_policy != SchedulePolicy::Static &&
+        schedule_policy != SchedulePolicy::Dynamic &&
+        schedule_policy != SchedulePolicy::Guided) {
+        throw std::invalid_argument(
+            "ParallelConfig::validate: unknown schedule_policy enum value (" +
+            std::to_string(static_cast<int>(schedule_policy)) + ")."
+        );
+    }
 }
 
-namespace {
+namespace detail {
 
-/**
- * @brief RAII guard to safely set and restore OpenMP runtime loop schedule.
- *
- * When using `schedule(runtime)`, OpenMP reads the schedule set by `omp_set_schedule()`.
- * This guard records the prior schedule and restores it upon scope exit, preventing
- * schedule configuration from leaking into other parts of the application.
- */
-struct OmpScheduleGuard {
-    omp_sched_t orig_sched{omp_sched_static};
-    int orig_modifier{0};
+OmpScheduleGuard::OmpScheduleGuard(SchedulePolicy policy, int chunk_size) {
+    omp_get_schedule(&orig_sched, &orig_modifier);
 
-    OmpScheduleGuard(SchedulePolicy policy, int chunk_size) {
-        omp_get_schedule(&orig_sched, &orig_modifier);
-
-        omp_sched_t target_sched = omp_sched_static;
-        switch (policy) {
-            case SchedulePolicy::Static:  target_sched = omp_sched_static;  break;
-            case SchedulePolicy::Dynamic: target_sched = omp_sched_dynamic; break;
-            case SchedulePolicy::Guided:  target_sched = omp_sched_guided;  break;
-        }
-
-        omp_set_schedule(target_sched, chunk_size);
+    omp_sched_t target_sched = omp_sched_static;
+    switch (policy) {
+        case SchedulePolicy::Static:  target_sched = omp_sched_static;  break;
+        case SchedulePolicy::Dynamic: target_sched = omp_sched_dynamic; break;
+        case SchedulePolicy::Guided:  target_sched = omp_sched_guided;  break;
+        default:
+            throw std::invalid_argument("OmpScheduleGuard: unknown schedule policy enum value.");
     }
 
-    ~OmpScheduleGuard() {
-        omp_set_schedule(orig_sched, orig_modifier);
-    }
-};
+    omp_set_schedule(target_sched, chunk_size);
+}
 
-} // namespace
+OmpScheduleGuard::~OmpScheduleGuard() {
+    omp_set_schedule(orig_sched, orig_modifier);
+}
+
+} // namespace detail
 
 PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
                                      const ParallelConfig& config) {
     config.validate();
+
+    // RAII guard safely sets requested OpenMP runtime schedule and restores prior state on return/exception
+    detail::OmpScheduleGuard schedule_guard(config.schedule_policy, config.chunk_size);
 
     using Clock = std::chrono::high_resolution_clock;
     auto pipeline_start = Clock::now();
@@ -98,9 +99,6 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
         }
         result.document_ids[i] = doc.id;
     }
-
-    // Apply RAII guard for the requested OpenMP loop schedule
-    OmpScheduleGuard schedule_guard(config.schedule_policy, config.chunk_size);
 
     // -------------------------------------------------------------
     // Stage 1: Parallel Document Fingerprinting
@@ -228,26 +226,24 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // -------------------------------------------------------------
     // Strategy: Loop over all active buckets in parallel using OpenMP.
     // Concurrency Safety:
-    // - Each thread accumulates pairs into thread-local storage (`tl_candidates[tid]`).
-    // - Avoids atomic/mutex locks around candidate insertion entirely.
-    // - After parallel loop, thread-local vectors are sequentially concatenated.
+    // - Preallocated vector of per-thread buffer slots (per_thread_candidates[tid]).
+    // - Note: We use heap-allocated per-thread vector slots indexed by thread ID (0 <= tid < thread_count),
+    //   NOT C++ `thread_local` storage duration. This guarantees deterministic lifetimes and
+    //   avoids TLS overhead, limits, or barrier synchronization.
+    // - Thread `tid` appends pairs exclusively to its dedicated slot `per_thread_candidates[tid]`.
+    // - Completely avoids mutexes, locks, or critical sections.
+    // - After parallel loop, per-thread slots are sequentially concatenated.
     // - Final candidates are sorted and deduplicated via std::unique to guarantee
     //   bitwise-deterministic candidate ordering identical to sequential execution.
     auto t3_start = Clock::now();
 
     size_t num_active_buckets = active_buckets.size();
-    std::vector<std::vector<CandidatePair>> thread_local_candidates;
+    std::vector<std::vector<CandidatePair>> per_thread_candidates(config.thread_count);
 
     #pragma omp parallel num_threads(config.thread_count) default(none) \
-        shared(active_buckets, num_active_buckets, thread_local_candidates)
+        shared(active_buckets, num_active_buckets, per_thread_candidates)
     {
         int tid = omp_get_thread_num();
-        int total_threads = omp_get_num_threads();
-
-        #pragma omp single
-        {
-            thread_local_candidates.resize(total_threads);
-        }
 
         #pragma omp for schedule(runtime)
         for (size_t b = 0; b < num_active_buckets; ++b) {
@@ -260,26 +256,26 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
                     uint64_t v = bucket_docs[j];
                     if (u != v) {
                         CandidatePair pair = (u < v) ? CandidatePair{u, v} : CandidatePair{v, u};
-                        thread_local_candidates[tid].push_back(pair);
+                        per_thread_candidates[tid].push_back(pair);
                     }
                 }
             }
         }
     }
 
-    // Merge thread-local candidate lists
+    // Merge per-thread candidate lists sequentially
     size_t total_raw_candidates = 0;
-    for (const auto& tl_vec : thread_local_candidates) {
-        total_raw_candidates += tl_vec.size();
+    for (const auto& pt_vec : per_thread_candidates) {
+        total_raw_candidates += pt_vec.size();
     }
 
     std::vector<CandidatePair> raw_candidates;
     raw_candidates.reserve(total_raw_candidates);
-    for (auto& tl_vec : thread_local_candidates) {
+    for (auto& pt_vec : per_thread_candidates) {
         raw_candidates.insert(
             raw_candidates.end(),
-            std::make_move_iterator(tl_vec.begin()),
-            std::make_move_iterator(tl_vec.end())
+            std::make_move_iterator(pt_vec.begin()),
+            std::make_move_iterator(pt_vec.end())
         );
     }
 
@@ -301,25 +297,21 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     // -------------------------------------------------------------
     // Strategy: Loop over all candidate pairs in parallel using OpenMP.
     // Concurrency Safety:
-    // - Each candidate pair is checked independently against fingerprints.
-    // - Matching pairs are appended to thread-local storage (`tl_verified[tid]`).
-    // - After parallel loop, thread-local results are merged and sorted lexicographically
-    //   to preserve exact, bitwise-deterministic ordering matching sequential execution.
+    // - Preallocated vector of per-thread buffer slots (per_thread_verified[tid]).
+    // - Disjoint per-thread accumulation (vector of vectors, not C++ `thread_local`).
+    // - Read-only lookup into `id_to_index` and `result.fingerprints`.
+    // - After parallel loop, per-thread slots are sequentially concatenated and sorted
+    //   lexicographically to preserve exact, bitwise-deterministic ordering matching
+    //   the sequential reference pipeline.
     auto t4_start = Clock::now();
 
     size_t num_candidates = result.candidate_pairs.size();
-    std::vector<std::vector<VerifiedPair>> thread_local_verified;
+    std::vector<std::vector<VerifiedPair>> per_thread_verified(config.thread_count);
 
     #pragma omp parallel num_threads(config.thread_count) default(none) \
-        shared(result, num_candidates, id_to_index, config, thread_local_verified)
+        shared(result, num_candidates, id_to_index, config, per_thread_verified)
     {
         int tid = omp_get_thread_num();
-        int total_threads = omp_get_num_threads();
-
-        #pragma omp single
-        {
-            thread_local_verified.resize(total_threads);
-        }
 
         #pragma omp for schedule(runtime)
         for (size_t c = 0; c < num_candidates; ++c) {
@@ -332,23 +324,23 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
 
             int dist = hamming_distance(fp1, fp2);
             if (dist <= config.base_config.max_hamming_threshold) {
-                thread_local_verified[tid].push_back(VerifiedPair{candidate.first, candidate.second, dist});
+                per_thread_verified[tid].push_back(VerifiedPair{candidate.first, candidate.second, dist});
             }
         }
     }
 
-    // Merge thread-local verified pairs
+    // Merge per-thread verified pairs sequentially
     size_t total_verified = 0;
-    for (const auto& tl_vec : thread_local_verified) {
-        total_verified += tl_vec.size();
+    for (const auto& pt_vec : per_thread_verified) {
+        total_verified += pt_vec.size();
     }
 
     result.verified_pairs.reserve(total_verified);
-    for (auto& tl_vec : thread_local_verified) {
+    for (auto& pt_vec : per_thread_verified) {
         result.verified_pairs.insert(
             result.verified_pairs.end(),
-            std::make_move_iterator(tl_vec.begin()),
-            std::make_move_iterator(tl_vec.end())
+            std::make_move_iterator(pt_vec.begin()),
+            std::make_move_iterator(pt_vec.end())
         );
     }
 

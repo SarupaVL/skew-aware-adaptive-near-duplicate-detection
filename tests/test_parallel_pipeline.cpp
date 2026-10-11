@@ -240,6 +240,223 @@ void test_repeated_runs_determinism() {
     }
 }
 
+void test_invalid_parallel_configs() {
+    Document doc{1, 1, DocumentKind::Original, -1, "valid document text"};
+
+    // 1. Thread count <= 0
+    {
+        ParallelConfig pcfg;
+        pcfg.thread_count = 0;
+        bool caught = false;
+        try {
+            pcfg.validate();
+        } catch (const std::invalid_argument&) {
+            caught = true;
+        }
+        check(caught, "test_invalid_thread_count_zero", "thread_count = 0 must be rejected.");
+
+        caught = false;
+        try {
+            pcfg.thread_count = -4;
+            pcfg.validate();
+        } catch (const std::invalid_argument&) {
+            caught = true;
+        }
+        check(caught, "test_invalid_thread_count_negative", "Negative thread_count must be rejected.");
+    }
+
+    // 2. Negative chunk size
+    {
+        ParallelConfig pcfg;
+        pcfg.chunk_size = -1;
+        bool caught = false;
+        try {
+            pcfg.validate();
+        } catch (const std::invalid_argument&) {
+            caught = true;
+        }
+        check(caught, "test_invalid_chunk_size_negative", "Negative chunk_size must be rejected.");
+    }
+
+    // 3. Unknown SchedulePolicy enum
+    {
+        ParallelConfig pcfg;
+        pcfg.schedule_policy = static_cast<SchedulePolicy>(999);
+        bool caught = false;
+        try {
+            pcfg.validate();
+        } catch (const std::invalid_argument&) {
+            caught = true;
+        }
+        check(caught, "test_invalid_schedule_enum_999", "Unknown SchedulePolicy enum value 999 must be rejected.");
+
+        caught = false;
+        try {
+            pcfg.schedule_policy = static_cast<SchedulePolicy>(-1);
+            pcfg.validate();
+        } catch (const std::invalid_argument&) {
+            caught = true;
+        }
+        check(caught, "test_invalid_schedule_enum_negative", "Invalid SchedulePolicy enum value -1 must be rejected.");
+    }
+}
+
+void test_omp_schedule_guard_unit() {
+    // 1. Normal scope exit restoration
+    omp_set_schedule(omp_sched_guided, 16);
+    {
+        detail::OmpScheduleGuard guard(SchedulePolicy::Dynamic, 4);
+
+        omp_sched_t current_sched;
+        int current_chunk = 0;
+        omp_get_schedule(&current_sched, &current_chunk);
+        check(current_sched == omp_sched_dynamic && current_chunk == 4,
+              "test_guard_unit_inner_scope",
+              "OmpScheduleGuard must set requested schedule in inner scope.");
+    }
+
+    omp_sched_t restored_sched;
+    int restored_chunk = 0;
+    omp_get_schedule(&restored_sched, &restored_chunk);
+    check(restored_sched == omp_sched_guided && restored_chunk == 16,
+          "test_guard_unit_normal_restore",
+          "OmpScheduleGuard must restore prior schedule on normal scope exit.");
+
+    // 2. Exception unwinding restoration
+    omp_set_schedule(omp_sched_static, 8);
+    bool caught = false;
+    try {
+        detail::OmpScheduleGuard guard(SchedulePolicy::Guided, 3);
+        throw std::runtime_error("simulated error during guarded execution");
+    } catch (const std::runtime_error&) {
+        caught = true;
+    }
+    check(caught, "test_guard_unit_exception_caught", "Exception must be caught.");
+
+    omp_get_schedule(&restored_sched, &restored_chunk);
+    check(restored_sched == omp_sched_static && restored_chunk == 8,
+          "test_guard_unit_exception_restore",
+          "OmpScheduleGuard must restore prior schedule upon exception unwinding.");
+}
+
+void test_schedule_restoration_integration() {
+    DatasetConfig dcfg;
+    dcfg.total_documents = 20;
+    dcfg.random_seed = 601;
+    auto docs = generate_dataset(dcfg);
+
+    // 1. Normal pipeline execution does not leak schedule
+    omp_set_schedule(omp_sched_guided, 5);
+
+    ParallelConfig pcfg;
+    pcfg.thread_count = 2;
+    pcfg.schedule_policy = SchedulePolicy::Dynamic;
+    pcfg.chunk_size = 3;
+
+    PipelineResult res = run_parallel_pipeline(docs, pcfg);
+    (void)res;
+
+    omp_sched_t post_sched;
+    int post_chunk = 0;
+    omp_get_schedule(&post_sched, &post_chunk);
+    check(post_sched == omp_sched_guided && post_chunk == 5,
+          "test_pipeline_schedule_restore_normal",
+          "run_parallel_pipeline must restore caller schedule on normal return.");
+
+    // 2. Exception in pipeline does not leak schedule
+    omp_set_schedule(omp_sched_dynamic, 7);
+
+    Document d1{55, 1, DocumentKind::Original, -1, "alpha beta gamma"};
+    Document d2{55, 1, DocumentKind::ExactCopy, 55, "alpha beta gamma"}; // Duplicate ID 55
+    std::vector<Document> duplicate_docs = {d1, d2};
+
+    ParallelConfig pcfg_dup;
+    pcfg_dup.thread_count = 2;
+    pcfg_dup.schedule_policy = SchedulePolicy::Static;
+    pcfg_dup.chunk_size = 0;
+
+    bool caught = false;
+    try {
+        run_parallel_pipeline(duplicate_docs, pcfg_dup);
+    } catch (const std::invalid_argument&) {
+        caught = true;
+    }
+    check(caught, "test_pipeline_duplicate_id_threw", "Duplicate ID must throw.");
+
+    omp_get_schedule(&post_sched, &post_chunk);
+    check(post_sched == omp_sched_dynamic && post_chunk == 7,
+          "test_pipeline_schedule_restore_exception",
+          "run_parallel_pipeline must restore caller schedule after exception unwinding.");
+}
+
+void test_threads_exceed_iterations() {
+    // Test small inputs with high thread count (8 threads)
+    // 1. Exactly 1 document (0 active buckets)
+    Document doc_single{101, 1, DocumentKind::Original, -1, "parallel loop boundary test single doc"};
+    std::vector<Document> docs_single = {doc_single};
+
+    PipelineResult seq_single = run_sequential_pipeline(docs_single);
+    ParallelConfig pcfg_high_threads;
+    pcfg_high_threads.thread_count = 8;
+
+    for (auto policy : {SchedulePolicy::Static, SchedulePolicy::Dynamic, SchedulePolicy::Guided}) {
+        pcfg_high_threads.schedule_policy = policy;
+        PipelineResult par = run_parallel_pipeline(docs_single, pcfg_high_threads);
+        assert_pipeline_results_equal(seq_single, par,
+            "test_single_doc_8threads_" + std::string(to_string(policy)));
+    }
+
+    // 2. Exactly 2 identical documents (1 active bucket with 1 candidate pair)
+    Document doc_dup1{201, 2, DocumentKind::Original, -1, "small dataset high concurrency thread count"};
+    Document doc_dup2{202, 2, DocumentKind::ExactCopy, 201, "small dataset high concurrency thread count"};
+    std::vector<Document> docs_dup = {doc_dup1, doc_dup2};
+
+    PipelineResult seq_dup = run_sequential_pipeline(docs_dup);
+    for (auto policy : {SchedulePolicy::Static, SchedulePolicy::Dynamic, SchedulePolicy::Guided}) {
+        pcfg_high_threads.schedule_policy = policy;
+        PipelineResult par = run_parallel_pipeline(docs_dup, pcfg_high_threads);
+        assert_pipeline_results_equal(seq_dup, par,
+            "test_two_docs_8threads_" + std::string(to_string(policy)));
+    }
+
+    // 3. Exactly 3 unrelated documents (0 active buckets)
+    Document doc_unrel1{301, 3, DocumentKind::Original, -1, "alpha bravo charlie delta echo"};
+    Document doc_unrel2{302, 4, DocumentKind::Original, -1, "hotel india juliet kilo lima"};
+    Document doc_unrel3{303, 5, DocumentKind::Original, -1, "victor whiskey xray yankee zulu"};
+    std::vector<Document> docs_unrel = {doc_unrel1, doc_unrel2, doc_unrel3};
+
+    PipelineResult seq_unrel = run_sequential_pipeline(docs_unrel);
+    for (auto policy : {SchedulePolicy::Static, SchedulePolicy::Dynamic, SchedulePolicy::Guided}) {
+        pcfg_high_threads.schedule_policy = policy;
+        PipelineResult par = run_parallel_pipeline(docs_unrel, pcfg_high_threads);
+        assert_pipeline_results_equal(seq_unrel, par,
+            "test_three_unrel_8threads_" + std::string(to_string(policy)));
+    }
+}
+
+void test_chunk_size_zero_defaults() {
+    DatasetConfig dcfg;
+    dcfg.total_documents = 40;
+    dcfg.exact_duplicate_ratio = 0.25;
+    dcfg.modified_copy_ratio = 0.25;
+    dcfg.random_seed = 707;
+    auto docs = generate_dataset(dcfg);
+
+    PipelineResult seq_ref = run_sequential_pipeline(docs);
+
+    // chunk_size = 0 tests OpenMP standard defaults across all 3 policies
+    for (auto policy : {SchedulePolicy::Static, SchedulePolicy::Dynamic, SchedulePolicy::Guided}) {
+        ParallelConfig pcfg;
+        pcfg.thread_count = 4;
+        pcfg.schedule_policy = policy;
+        pcfg.chunk_size = 0; // OpenMP default
+
+        PipelineResult par = run_parallel_pipeline(docs, pcfg);
+        assert_pipeline_results_equal(seq_ref, par,
+            "test_chunk_zero_" + std::string(to_string(policy)));
+    }
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << " Running Phase 4 Test Suite: OpenMP Parallel Baselines\n";
@@ -252,6 +469,11 @@ int main() {
     test_multiple_candidates_and_threshold_boundaries();
     test_scheduling_policies_and_thread_counts();
     test_repeated_runs_determinism();
+    test_invalid_parallel_configs();
+    test_omp_schedule_guard_unit();
+    test_schedule_restoration_integration();
+    test_threads_exceed_iterations();
+    test_chunk_size_zero_defaults();
 
     std::cout << "\n=========================================================\n";
     std::cout << " All Phase 4 Parallel Pipeline Tests Passed Successfully!\n";
