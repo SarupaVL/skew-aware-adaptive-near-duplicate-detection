@@ -667,9 +667,164 @@ void test_invalid_configs_and_schedule_restoration() {
     }
 }
 
+// Phase 9: Focused unit & parity tests for parallel candidate aggregation and deduplication
+void test_parallel_candidate_aggregation_phase9() {
+    auto seq_reference = [](const std::vector<std::vector<CandidatePair>>& buffers) {
+        std::vector<CandidatePair> ref;
+        for (const auto& b : buffers) {
+            ref.insert(ref.end(), b.begin(), b.end());
+        }
+        std::sort(ref.begin(), ref.end());
+        ref.erase(std::unique(ref.begin(), ref.end()), ref.end());
+        return ref;
+    };
+
+    // 1. Empty candidate input (empty outer vector and non-empty outer vector of empty inner buffers)
+    {
+        std::vector<std::vector<CandidatePair>> empty_outer;
+        auto res1 = aggregate_and_deduplicate_candidates(empty_outer, 4, 0);
+        check(res1.empty(), "test_p9_empty_outer", "Empty outer buffer vector must return empty result.");
+
+        std::vector<std::vector<CandidatePair>> empty_inner(4);
+        auto res2 = aggregate_and_deduplicate_candidates(empty_inner, 4, 8);
+        check(res2.empty(), "test_p9_empty_inner", "Empty inner worker buffers must return empty result.");
+
+        bool caught_invalid_threads = false;
+        try {
+            aggregate_and_deduplicate_candidates(empty_inner, 0, 4);
+        } catch (const std::invalid_argument&) {
+            caught_invalid_threads = true;
+        }
+        check(caught_invalid_threads, "test_p9_invalid_threads", "thread_count <= 0 must throw.");
+    }
+
+    // 2. Small inputs where parallel aggregation is not worthwhile (automatic single-partition fast path)
+    {
+        std::vector<std::vector<CandidatePair>> small_bufs = {
+            {{10, 20}, {5, 15}, {10, 20}},
+            {},
+            {{1, 2}, {5, 15}, {1, 3}},
+            {{10, 19}}
+        };
+        auto expected = seq_reference(small_bufs);
+        auto actual = aggregate_and_deduplicate_candidates(small_bufs, 4, 0); // auto -> 1 partition since M = 7 < 4096
+        check(actual == expected, "test_p9_small_auto_fastpath",
+              "Small input below kMinParallelAggregationPairs must match sequential sort+unique.");
+    }
+
+    // 3. One partition and multiple partitions (explicit P = 1, 2, 4, 8, 16, 64)
+    //    + Duplicate pairs repeated within a partition and across different worker buffers
+    {
+        std::vector<std::vector<CandidatePair>> base_bufs(4);
+        for (uint64_t u = 1; u <= 80; ++u) {
+            for (uint64_t v = u + 1; v <= 85; ++v) {
+                CandidatePair cp{u, v};
+                // Emit duplicates within the same buffer and across multiple worker buffers
+                size_t b1 = static_cast<size_t>((u + v) % 4);
+                size_t b2 = static_cast<size_t>((u * 3 + v) % 4);
+                base_bufs[b1].push_back(cp);
+                base_bufs[b1].push_back(cp); // intra-buffer / intra-partition duplicate
+                base_bufs[b2].push_back(cp); // cross-worker-buffer duplicate
+            }
+        }
+        // Reverse two buffers so input is unsorted
+        std::reverse(base_bufs[0].begin(), base_bufs[0].end());
+        std::reverse(base_bufs[2].begin(), base_bufs[2].end());
+
+        auto expected = seq_reference(base_bufs);
+        for (size_t parts : {size_t(1), size_t(2), size_t(3), size_t(4), size_t(8), size_t(16), size_t(64)}) {
+            for (int threads : {1, 2, 4, 8}) {
+                auto bufs_copy = base_bufs;
+                auto actual = aggregate_and_deduplicate_candidates(bufs_copy, threads, parts);
+                check(actual == expected,
+                      "test_p9_partitions_" + std::to_string(parts) + "_t" + std::to_string(threads),
+                      "Explicit partition count and cross-buffer duplicates must match reference.");
+            }
+        }
+    }
+
+    // 4. Candidate pairs near partition boundaries (including 0 and UINT64_MAX extremes)
+    {
+        // With min_first = 100, max_first = 139 (span = 39) and P = 4:
+        // bucket_width = 39 / 4 + 1 = 10.
+        // Partition boundaries on `first` are [100..109], [110..119], [120..129], [130..139].
+        std::vector<std::vector<CandidatePair>> boundary_bufs(3);
+        const std::vector<uint64_t> first_vals = {
+            100, 101, 108, 109, 110, 111, 118, 119, 120, 121, 128, 129, 130, 131, 138, 139
+        };
+        for (uint64_t f : first_vals) {
+            for (uint64_t s : {uint64_t(140), uint64_t(141), uint64_t(200), uint64_t(999999)}) {
+                boundary_bufs[0].push_back(CandidatePair{f, s});
+                boundary_bufs[1].push_back(CandidatePair{f, s}); // duplicate in worker 1
+                boundary_bufs[2].push_back(CandidatePair{f, s + 1});
+            }
+        }
+        auto expected = seq_reference(boundary_bufs);
+        auto actual = aggregate_and_deduplicate_candidates(boundary_bufs, 4, 4);
+        check(actual == expected, "test_p9_exact_partition_boundaries",
+              "Candidate pairs around partition boundaries must preserve exact global order and dedup.");
+
+        // Extreme 64-bit integer span [0, UINT64_MAX - 1]
+        const uint64_t max_u64 = std::numeric_limits<uint64_t>::max();
+        std::vector<std::vector<CandidatePair>> extreme_bufs = {
+            {{0, 1}, {max_u64 - 2, max_u64 - 1}, {0, max_u64}, {max_u64 / 2, max_u64}},
+            {{0, 1}, {1, 2}, {max_u64 - 2, max_u64}, {max_u64 - 2, max_u64 - 1}}
+        };
+        auto expected_ext = seq_reference(extreme_bufs);
+        auto actual_ext = aggregate_and_deduplicate_candidates(extreme_bufs, 4, 8);
+        check(actual_ext == expected_ext, "test_p9_uint64_max_span",
+              "Full 64-bit ID span [0, UINT64_MAX] must not overflow bucket_width.");
+    }
+
+    // 5. Highly skewed partition sizes (Case A: 95% of pairs in Partition 0 via non-contiguous outlier ID;
+    //    Case B: 100% of pairs sharing the exact same `first` ID; Case C: all pairs identical)
+    {
+        // Case A: 6,000 pairs with `first` in [1..60] and 1 outlier pair with `first` = 1,000,000,000
+        // so Partition 0 gets > 99% of all pairs (> kMinParallelAggregationPairs and > total_raw / 2),
+        // exercising `parallel_sort_dedup_oversized_partition`.
+        std::vector<std::vector<CandidatePair>> skewed_bufs(4);
+        for (uint64_t u = 1; u <= 60; ++u) {
+            for (uint64_t v = u + 1; v <= 120; ++v) {
+                skewed_bufs[(u + v) % 4].push_back(CandidatePair{u, v});
+                skewed_bufs[(u * 7 + v) % 4].push_back(CandidatePair{u, v}); // duplicate
+            }
+        }
+        skewed_bufs[3].push_back(CandidatePair{1000000000ULL, 1000000001ULL});
+        skewed_bufs[0].push_back(CandidatePair{500000000ULL, 1000000001ULL});
+
+        auto expected_skew = seq_reference(skewed_bufs);
+        for (int threads : {1, 2, 4, 8}) {
+            auto copy_bufs = skewed_bufs;
+            auto actual_skew = aggregate_and_deduplicate_candidates(copy_bufs, threads, 16);
+            check(actual_skew == expected_skew,
+                  "test_p9_heavily_skewed_partition_t" + std::to_string(threads),
+                  "Heavily skewed partition (>99% in partition 0) must match sequential reference.");
+        }
+
+        // Case B: All pairs share the exact same `first` ID (exercises `second`-ID partitioning fallback)
+        std::vector<std::vector<CandidatePair>> same_first_bufs(4);
+        for (uint64_t v = 5000; v >= 100; --v) {
+            same_first_bufs[v % 4].push_back(CandidatePair{42, v});
+            same_first_bufs[(v + 1) % 4].push_back(CandidatePair{42, v});
+        }
+        auto expected_same_first = seq_reference(same_first_bufs);
+        auto actual_same_first = aggregate_and_deduplicate_candidates(same_first_bufs, 4, 16);
+        check(actual_same_first == expected_same_first,
+              "test_p9_same_first_id_fallback",
+              "All pairs sharing identical first ID must partition on second ID and match reference.");
+
+        // Case C: All pairs completely identical across all worker buffers
+        std::vector<std::vector<CandidatePair>> identical_bufs(4, std::vector<CandidatePair>(1500, CandidatePair{7, 99}));
+        auto actual_ident = aggregate_and_deduplicate_candidates(identical_bufs, 4, 8);
+        check(actual_ident.size() == 1 && actual_ident[0] == CandidatePair{7, 99},
+              "test_p9_all_identical_pairs",
+              "All-identical pairs must collapse to a single pair.");
+    }
+}
+
 int main() {
     std::cout << "=================================================================\n";
-    std::cout << " Running Phase 5 Test Suite: Adaptive Scheduling & Heavy Buckets\n";
+    std::cout << " Running Phase 5 & Phase 9 Test Suite: Adaptive & Aggregation\n";
     std::cout << "=================================================================\n";
 
     test_empty_and_single_document();
@@ -682,9 +837,10 @@ int main() {
     test_thread_counts_repeated_runs_and_baselines();
     test_non_contiguous_and_reordered_ids();
     test_invalid_configs_and_schedule_restoration();
+    test_parallel_candidate_aggregation_phase9();
 
     std::cout << "\n=================================================================\n";
-    std::cout << " All Phase 5 Adaptive Pipeline Tests Passed Successfully!\n";
+    std::cout << " All Phase 5 & Phase 9 Adaptive Pipeline Tests Passed!\n";
     std::cout << "=================================================================\n";
     return 0;
 }

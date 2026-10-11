@@ -18,6 +18,13 @@ inline constexpr double kDefaultOversizedMultiplier = 4.0;  ///< W_i > 4.0 * mea
 inline constexpr uint64_t kDefaultMaxPairTaskSize = 4096;   ///< Max candidate pair positions per heavy-bucket chunk
 
 /**
+ * @brief Default parameters for parallel candidate pair aggregation and deduplication (Phase 9).
+ */
+inline constexpr size_t kMinParallelAggregationPairs = 4096; ///< Minimum raw pairs before multi-partition parallel aggregation
+inline constexpr size_t kPartitionsPerThread = 8;            ///< Target ordered range partitions per OpenMP worker thread
+inline constexpr size_t kMaxAggregationPartitions = 64;      ///< Maximum range partitions to bound histogram metadata
+
+/**
  * @brief Supported OpenMP loop scheduling policies for baseline parallel execution.
  */
 enum class SchedulePolicy {
@@ -163,8 +170,8 @@ struct AdaptiveDiagnostics {
  *   baseline policy (Static or Dynamic).
  * - heavy_chunk_generation_ms: Partitioning oversized buckets into compact HeavyBucketChunk descriptors.
  * - heavy_pair_processing_ms: Parallel pair generation across heavy-bucket chunks under OpenMP Dynamic scheduling.
- * - merge_sort_dedup_ms: Sequential concatenation of per-thread candidate buffers, lexicographical
- *   sorting, and std::unique deduplication.
+ * - merge_sort_dedup_ms: Ordered range-partitioned parallel candidate aggregation, per-partition
+ *   lexicographical sorting, std::unique deduplication, and compaction.
  * - verification_ms: Parallel Hamming-distance verification, sequential merge, and deterministic sort.
  * - total_pipeline_ms: Complete end-to-end wall-clock runtime of run_adaptive_pipeline().
  *
@@ -233,13 +240,39 @@ std::vector<HeavyBucketChunk> split_bucket_into_chunks(size_t band_index,
                                                        uint64_t max_pair_task_size = kDefaultMaxPairTaskSize);
 
 /**
+ * @brief Aggregates, lexicographically sorts, and deduplicates normalized candidate pairs
+ *        collected across per-thread worker buffers using ordered range partitioning (Phase 9).
+ *
+ * Correctness & Ordering Guarantees:
+ * - Every CandidatePair is mapped deterministically to exactly one range partition p in [0, P - 1]
+ *   consistent with CandidatePair::operator< (lexicographical on (first, second)).
+ * - For any p < q, every pair in partition p is strictly less than every pair in partition q.
+ * - Duplicate pairs (identical first and second) always map to the same partition p regardless
+ *   of which band or worker buffer emitted them.
+ * - Each partition is sorted and deduplicated independently in parallel, and the non-empty
+ *   deduplicated partitions are concatenated in partition order 0 .. P - 1, yielding a globally
+ *   sorted, duplicate-free vector bitwise-identical to sequential std::sort + std::unique.
+ * - Input worker_buffers are consumed (cleared and released) during aggregation to minimize peak memory.
+ *
+ * @param worker_buffers Per-thread vectors of normalized CandidatePairs (consumed in-place).
+ * @param thread_count Number of OpenMP threads to employ (must be > 0).
+ * @param requested_partitions Explicit partition count override (0 = automatic selection).
+ * @return std::vector<CandidatePair> Globally sorted, deduplicated candidate pairs.
+ */
+std::vector<CandidatePair> aggregate_and_deduplicate_candidates(
+    std::vector<std::vector<CandidatePair>>& worker_buffers,
+    int thread_count,
+    size_t requested_partitions = 0
+);
+
+/**
  * @brief Executes the end-to-end fixed-schedule OpenMP-parallel near-duplicate detection pipeline.
  *
  * Parallelized Stages:
  * 1. Fingerprinting: Parallel loop over documents writing to disjoint preallocated indices.
  * 2. Candidate Generation: Parallel loop over candidate buckets using per-thread buffer slots
- *    in a std::vector (indexed by thread ID, avoiding TLS overhead), merged and lexicographically
- *    sorted/deduplicated after parallel region.
+ *    in a std::vector (indexed by thread ID, avoiding TLS overhead), aggregated, lexicographically
+ *    sorted, and deduplicated via ordered range partitioning after the bucket loop.
  * 3. Verification: Parallel loop over deduplicated candidate pairs evaluating bitwise Hamming
  *    distance using per-thread buffer slots, merged and sorted after parallel region.
  *
@@ -269,8 +302,8 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
  * 5. Processes ordinary buckets in parallel using the selected baseline schedule.
  * 6. Splits oversized buckets into bounded HeavyBucketChunk ranges (at most max_pair_task_size pairs)
  *    and processes them in parallel using OpenMP Dynamic scheduling.
- * 7. Merges, lexicographically sorts, and deduplicates candidate pairs after all parallel work finishes,
- *    then verifies pairs in parallel using bitwise Hamming distance.
+ * 7. Aggregates, lexicographically sorts, and deduplicates candidate pairs in parallel using ordered
+ *    range partitioning (Stage 3e), then verifies pairs in parallel using bitwise Hamming distance.
  *
  * @param documents Input document collection.
  * @param config Adaptive configuration (thread count, CV threshold, oversized multiplier, max task size).

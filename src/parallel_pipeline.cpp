@@ -7,6 +7,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <omp.h>
 #include <sstream>
 #include <stdexcept>
@@ -99,6 +100,372 @@ OmpScheduleGuard::~OmpScheduleGuard() {
 }
 
 } // namespace detail
+
+namespace {
+
+/**
+ * @brief Slice descriptor for dividing uneven per-thread candidate buffers into bounded
+ *        contiguous ranges so all OpenMP threads participate evenly during counting and scattering.
+ */
+struct CandidateBufferSlice {
+    size_t buffer_idx{0};
+    size_t start_offset{0};
+    size_t end_offset{0};
+};
+
+inline constexpr size_t kScatterSlicePairs = 65536; ///< Max pairs per scatter slice
+
+/**
+ * @brief Parallel fallback for sorting and deduplicating a single heavily skewed partition
+ *        in-place across multiple OpenMP threads using sub-chunk sort/unique + inplace_merge.
+ */
+size_t parallel_sort_dedup_oversized_partition(
+    CandidatePair* begin_ptr,
+    size_t count,
+    int thread_count
+) {
+    if (count <= 1) {
+        return count;
+    }
+
+    size_t num_chunks = std::min<size_t>(
+        static_cast<size_t>(thread_count),
+        std::max<size_t>(1, count / 1024)
+    );
+    if (num_chunks <= 1) {
+        std::sort(begin_ptr, begin_ptr + count);
+        CandidatePair* uend = std::unique(begin_ptr, begin_ptr + count);
+        return static_cast<size_t>(uend - begin_ptr);
+    }
+
+    std::vector<size_t> sub_starts(num_chunks + 1, 0);
+    std::vector<size_t> sub_unique_lens(num_chunks, 0);
+    for (size_t c = 0; c < num_chunks; ++c) {
+        sub_starts[c] = (c * count) / num_chunks;
+    }
+    sub_starts[num_chunks] = count;
+
+    // 1. Sort and deduplicate each sub-chunk in parallel
+    #pragma omp parallel for num_threads(thread_count) schedule(static) default(none) \
+        shared(begin_ptr, num_chunks, sub_starts, sub_unique_lens)
+    for (size_t c = 0; c < num_chunks; ++c) {
+        CandidatePair* c_begin = begin_ptr + sub_starts[c];
+        CandidatePair* c_end = begin_ptr + sub_starts[c + 1];
+        std::sort(c_begin, c_end);
+        CandidatePair* c_uend = std::unique(c_begin, c_end);
+        sub_unique_lens[c] = static_cast<size_t>(c_uend - c_begin);
+    }
+
+    // 2. Compact deduplicated sub-chunks into contiguous adjacent segments
+    std::vector<size_t> compact_offs(num_chunks + 1, 0);
+    for (size_t c = 0; c < num_chunks; ++c) {
+        compact_offs[c + 1] = compact_offs[c] + sub_unique_lens[c];
+        if (c > 0 && sub_unique_lens[c] > 0 && compact_offs[c] < sub_starts[c]) {
+            std::copy(
+                begin_ptr + sub_starts[c],
+                begin_ptr + sub_starts[c] + sub_unique_lens[c],
+                begin_ptr + compact_offs[c]
+            );
+        }
+    }
+
+    size_t total_compact = compact_offs[num_chunks];
+    if (total_compact <= 1) {
+        return total_compact;
+    }
+
+    // 3. Bottom-up pairwise inplace_merge across compacted sorted segments
+    for (size_t width = 1; width < num_chunks; width *= 2) {
+        for (size_t i = 0; i + width < num_chunks; i += 2 * width) {
+            size_t left = compact_offs[i];
+            size_t mid = compact_offs[i + width];
+            size_t right = compact_offs[std::min(i + 2 * width, num_chunks)];
+            if (left < mid && mid < right) {
+                std::inplace_merge(begin_ptr + left, begin_ptr + mid, begin_ptr + right);
+            }
+        }
+    }
+
+    CandidatePair* final_end = std::unique(begin_ptr, begin_ptr + total_compact);
+    return static_cast<size_t>(final_end - begin_ptr);
+}
+
+} // namespace
+
+std::vector<CandidatePair> aggregate_and_deduplicate_candidates(
+    std::vector<std::vector<CandidatePair>>& worker_buffers,
+    int thread_count,
+    size_t requested_partitions
+) {
+    if (thread_count <= 0) {
+        throw std::invalid_argument(
+            "aggregate_and_deduplicate_candidates: thread_count must be positive (got " +
+            std::to_string(thread_count) + ")."
+        );
+    }
+
+    size_t total_raw = 0;
+    size_t non_empty_buffers = 0;
+    size_t single_non_empty_idx = 0;
+
+    for (size_t b = 0; b < worker_buffers.size(); ++b) {
+        size_t sz = worker_buffers[b].size();
+        if (sz > 0) {
+            total_raw += sz;
+            ++non_empty_buffers;
+            single_non_empty_idx = b;
+        }
+    }
+
+    if (total_raw == 0) {
+        for (auto& buf : worker_buffers) {
+            std::vector<CandidatePair>().swap(buf);
+        }
+        return {};
+    }
+
+    // Determine effective number of ordered range partitions
+    size_t num_partitions = requested_partitions;
+    if (num_partitions == 0) {
+        if (thread_count == 1 || total_raw < kMinParallelAggregationPairs) {
+            num_partitions = 1;
+        } else {
+            size_t target = static_cast<size_t>(thread_count) * kPartitionsPerThread;
+            num_partitions = std::min(kMaxAggregationPartitions, std::max<size_t>(2, target));
+            num_partitions = std::min(num_partitions, total_raw);
+        }
+    }
+
+    // Fast path for single partition (or T=1 / small input):
+    // Moves a single non-empty worker buffer directly in-place without allocating a second raw vector.
+    if (num_partitions <= 1) {
+        std::vector<CandidatePair> result;
+        if (non_empty_buffers == 1) {
+            result = std::move(worker_buffers[single_non_empty_idx]);
+        } else {
+            result = std::move(worker_buffers[0]);
+            result.reserve(total_raw);
+            for (size_t b = 1; b < worker_buffers.size(); ++b) {
+                if (!worker_buffers[b].empty()) {
+                    result.insert(
+                        result.end(),
+                        std::make_move_iterator(worker_buffers[b].begin()),
+                        std::make_move_iterator(worker_buffers[b].end())
+                    );
+                }
+                std::vector<CandidatePair>().swap(worker_buffers[b]);
+            }
+        }
+        for (auto& buf : worker_buffers) {
+            std::vector<CandidatePair>().swap(buf);
+        }
+
+        if (thread_count > 1 && result.size() >= kMinParallelAggregationPairs) {
+            size_t ucount = parallel_sort_dedup_oversized_partition(
+                result.data(), result.size(), thread_count
+            );
+            result.resize(ucount);
+        } else {
+            std::sort(result.begin(), result.end());
+            result.erase(std::unique(result.begin(), result.end()), result.end());
+        }
+        return result;
+    }
+
+    // Build bounded contiguous slices across non-empty worker buffers so counting and scattering
+    // remain load-balanced across threads even if worker_buffers have uneven sizes.
+    std::vector<CandidateBufferSlice> slices;
+    slices.reserve(non_empty_buffers + (total_raw / kScatterSlicePairs) + 1);
+    for (size_t b = 0; b < worker_buffers.size(); ++b) {
+        size_t sz = worker_buffers[b].size();
+        size_t off = 0;
+        while (off < sz) {
+            size_t len = std::min(kScatterSlicePairs, sz - off);
+            slices.push_back(CandidateBufferSlice{b, off, off + len});
+            off += len;
+        }
+    }
+    size_t num_slices = slices.size();
+
+    // Pass 1a: Parallel min/max reduction on first and second document IDs
+    uint64_t min_first = std::numeric_limits<uint64_t>::max();
+    uint64_t max_first = 0;
+    uint64_t min_second = std::numeric_limits<uint64_t>::max();
+    uint64_t max_second = 0;
+
+    #pragma omp parallel for num_threads(thread_count) schedule(static) default(none) \
+        shared(slices, num_slices, worker_buffers) \
+        reduction(min: min_first, min_second) reduction(max: max_first, max_second)
+    for (size_t s = 0; s < num_slices; ++s) {
+        const auto& sl = slices[s];
+        const CandidatePair* ptr = worker_buffers[sl.buffer_idx].data() + sl.start_offset;
+        size_t len = sl.end_offset - sl.start_offset;
+        for (size_t i = 0; i < len; ++i) {
+            uint64_t f = ptr[i].first;
+            uint64_t sec = ptr[i].second;
+            if (f < min_first) min_first = f;
+            if (f > max_first) max_first = f;
+            if (sec < min_second) min_second = sec;
+            if (sec > max_second) max_second = sec;
+        }
+    }
+
+    // If every candidate pair in the entire collection is identical, return that 1 unique pair immediately
+    if (min_first == max_first && min_second == max_second) {
+        for (auto& buf : worker_buffers) {
+            std::vector<CandidatePair>().swap(buf);
+        }
+        return {CandidatePair{min_first, min_second}};
+    }
+
+    // Partition by `first` ID when multiple distinct `first` values exist;
+    // if all pairs share the exact same `first` ID, partition by `second` ID.
+    // Both preserve the strict lexicographical total order of CandidatePair::operator<.
+    const bool partition_by_first = (min_first < max_first);
+    const uint64_t min_key = partition_by_first ? min_first : min_second;
+    const uint64_t max_key = partition_by_first ? max_first : max_second;
+    const uint64_t span = max_key - min_key;
+
+    // Safe ceiling division: bucket_width = floor(span / num_partitions) + 1 >= (span + 1) / num_partitions.
+    // Never overflows uint64_t since num_partitions >= 2.
+    const uint64_t bucket_width = (span / static_cast<uint64_t>(num_partitions)) + 1ULL;
+
+    // Pass 1b: Count per-slice partition histograms in parallel
+    std::vector<size_t> slice_counts(num_slices * num_partitions, 0);
+
+    #pragma omp parallel for num_threads(thread_count) schedule(static) default(none) \
+        shared(slices, num_slices, worker_buffers, slice_counts, \
+               num_partitions, min_key, bucket_width, partition_by_first)
+    for (size_t s = 0; s < num_slices; ++s) {
+        const auto& sl = slices[s];
+        const CandidatePair* src = worker_buffers[sl.buffer_idx].data() + sl.start_offset;
+        size_t len = sl.end_offset - sl.start_offset;
+        size_t* counts_row = &slice_counts[s * num_partitions];
+
+        for (size_t i = 0; i < len; ++i) {
+            uint64_t key = partition_by_first ? src[i].first : src[i].second;
+            size_t p = static_cast<size_t>((key - min_key) / bucket_width);
+            if (p >= num_partitions) {
+                p = num_partitions - 1;
+            }
+            ++counts_row[p];
+        }
+    }
+
+    // Compute contiguous partition offsets and disjoint per-slice write offsets
+    std::vector<size_t> part_offsets(num_partitions + 1, 0);
+    std::vector<size_t> slice_write_offsets(num_slices * num_partitions, 0);
+    size_t running_offset = 0;
+    for (size_t p = 0; p < num_partitions; ++p) {
+        part_offsets[p] = running_offset;
+        for (size_t s = 0; s < num_slices; ++s) {
+            slice_write_offsets[s * num_partitions + p] = running_offset;
+            running_offset += slice_counts[s * num_partitions + p];
+        }
+    }
+    part_offsets[num_partitions] = running_offset;
+
+    // Pass 2: Parallel lock-free scatter into contiguous range-partitioned workspace
+    std::vector<CandidatePair> partitioned_raw(total_raw);
+
+    #pragma omp parallel for num_threads(thread_count) schedule(static) default(none) \
+        shared(slices, num_slices, worker_buffers, partitioned_raw, slice_write_offsets, \
+               num_partitions, min_key, bucket_width, partition_by_first)
+    for (size_t s = 0; s < num_slices; ++s) {
+        const auto& sl = slices[s];
+        const CandidatePair* src = worker_buffers[sl.buffer_idx].data() + sl.start_offset;
+        size_t len = sl.end_offset - sl.start_offset;
+        size_t* out_pos = &slice_write_offsets[s * num_partitions];
+
+        for (size_t i = 0; i < len; ++i) {
+            const CandidatePair& cp = src[i];
+            uint64_t key = partition_by_first ? cp.first : cp.second;
+            size_t p = static_cast<size_t>((key - min_key) / bucket_width);
+            if (p >= num_partitions) {
+                p = num_partitions - 1;
+            }
+            partitioned_raw[out_pos[p]++] = cp;
+        }
+    }
+
+    // Release per-thread raw buffers immediately before sorting and output allocation
+    for (auto& buf : worker_buffers) {
+        std::vector<CandidatePair>().swap(buf);
+    }
+
+    // Pass 3: Sort and deduplicate each partition in-place.
+    // - If a single skewed partition holds > 50% of all pairs (and >= kMinParallelAggregationPairs),
+    //   it is sorted and deduplicated across all threads via parallel_sort_dedup_oversized_partition.
+    // - All remaining positive-size partitions are sorted in Longest-Processing-Time-First (LPT)
+    //   order under OpenMP schedule(dynamic, 1) to mitigate inter-partition skew.
+    std::vector<size_t> unique_counts(num_partitions, 0);
+    std::vector<size_t> regular_partitions;
+    regular_partitions.reserve(num_partitions);
+
+    for (size_t p = 0; p < num_partitions; ++p) {
+        size_t count = part_offsets[p + 1] - part_offsets[p];
+        if (count == 0) {
+            unique_counts[p] = 0;
+        } else if (count == 1) {
+            unique_counts[p] = 1;
+        } else if (thread_count > 1 &&
+                   count >= kMinParallelAggregationPairs &&
+                   count > (total_raw / 2)) {
+            unique_counts[p] = parallel_sort_dedup_oversized_partition(
+                partitioned_raw.data() + part_offsets[p], count, thread_count
+            );
+        } else {
+            regular_partitions.push_back(p);
+        }
+    }
+
+    // Order regular partitions from largest to smallest (LPT) so larger partitions start first
+    std::sort(regular_partitions.begin(), regular_partitions.end(),
+              [&](size_t a, size_t b) {
+                  size_t ca = part_offsets[a + 1] - part_offsets[a];
+                  size_t cb = part_offsets[b + 1] - part_offsets[b];
+                  if (ca != cb) {
+                      return ca > cb;
+                  }
+                  return a < b;
+              });
+
+    size_t num_regular = regular_partitions.size();
+    if (num_regular > 0) {
+        #pragma omp parallel for num_threads(thread_count) schedule(dynamic, 1) default(none) \
+            shared(regular_partitions, num_regular, part_offsets, partitioned_raw, unique_counts)
+        for (size_t idx = 0; idx < num_regular; ++idx) {
+            size_t p = regular_partitions[idx];
+            CandidatePair* begin_ptr = partitioned_raw.data() + part_offsets[p];
+            CandidatePair* end_ptr = partitioned_raw.data() + part_offsets[p + 1];
+            std::sort(begin_ptr, end_ptr);
+            CandidatePair* uend = std::unique(begin_ptr, end_ptr);
+            unique_counts[p] = static_cast<size_t>(uend - begin_ptr);
+        }
+    }
+
+    // Pass 4: Compute output prefix sums in canonical partition order 0 .. P-1 and compact in parallel
+    std::vector<size_t> out_offsets(num_partitions + 1, 0);
+    for (size_t p = 0; p < num_partitions; ++p) {
+        out_offsets[p + 1] = out_offsets[p] + unique_counts[p];
+    }
+    size_t total_unique = out_offsets[num_partitions];
+
+    std::vector<CandidatePair> result(total_unique);
+
+    #pragma omp parallel for num_threads(thread_count) schedule(dynamic, 1) default(none) \
+        shared(num_partitions, part_offsets, out_offsets, unique_counts, partitioned_raw, result)
+    for (size_t p = 0; p < num_partitions; ++p) {
+        size_t ucount = unique_counts[p];
+        if (ucount > 0) {
+            const CandidatePair* src = partitioned_raw.data() + part_offsets[p];
+            CandidatePair* dst = result.data() + out_offsets[p];
+            std::copy(src, src + ucount, dst);
+        }
+    }
+
+    return result;
+}
 
 PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
                                      const ParallelConfig& config) {
@@ -327,29 +694,10 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     }
     result.per_thread_units_processed = std::move(per_thread_units);
 
-    // Merge per-thread candidate lists sequentially
-    size_t total_raw_candidates = 0;
-    for (const auto& pt_vec : per_thread_candidates) {
-        total_raw_candidates += pt_vec.size();
-    }
-
-    std::vector<CandidatePair> raw_candidates;
-    raw_candidates.reserve(total_raw_candidates);
-    for (auto& pt_vec : per_thread_candidates) {
-        raw_candidates.insert(
-            raw_candidates.end(),
-            std::make_move_iterator(pt_vec.begin()),
-            std::make_move_iterator(pt_vec.end())
-        );
-    }
-
-    // Deterministic sort and deduplication
-    std::sort(raw_candidates.begin(), raw_candidates.end());
-    raw_candidates.erase(
-        std::unique(raw_candidates.begin(), raw_candidates.end()),
-        raw_candidates.end()
+    // Aggregate, sort, and deduplicate per-thread candidate lists in parallel using ordered range partitioning
+    result.candidate_pairs = aggregate_and_deduplicate_candidates(
+        per_thread_candidates, config.thread_count
     );
-    result.candidate_pairs = std::move(raw_candidates);
 
     auto t3_end = SteadyClock::now();
     result.timings.candidate_generation_dedup_ms = elapsed_ms(t3_start, t3_end);
@@ -977,7 +1325,7 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     timings.heavy_pair_processing_ms = elapsed_ms(t3d_start, t3d_end);
 
     // -------------------------------------------------------------
-    // Stage 3e: Sequential Merge, Sort & Deduplication
+    // Stage 3e: Parallel Candidate Aggregation, Sort & Deduplication
     // -------------------------------------------------------------
     auto t3e_start = SteadyClock::now();
 
@@ -990,27 +1338,9 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     diag.per_thread_pair_work = result.per_thread_pair_work;
     diag.per_thread_units_processed = result.per_thread_units_processed;
 
-    size_t total_raw_candidates = 0;
-    for (const auto& pt_vec : per_thread_candidates) {
-        total_raw_candidates += pt_vec.size();
-    }
-
-    std::vector<CandidatePair> raw_candidates;
-    raw_candidates.reserve(total_raw_candidates);
-    for (auto& pt_vec : per_thread_candidates) {
-        raw_candidates.insert(
-            raw_candidates.end(),
-            std::make_move_iterator(pt_vec.begin()),
-            std::make_move_iterator(pt_vec.end())
-        );
-    }
-
-    std::sort(raw_candidates.begin(), raw_candidates.end());
-    raw_candidates.erase(
-        std::unique(raw_candidates.begin(), raw_candidates.end()),
-        raw_candidates.end()
+    result.candidate_pairs = aggregate_and_deduplicate_candidates(
+        per_thread_candidates, config.thread_count
     );
-    result.candidate_pairs = std::move(raw_candidates);
 
     auto t3e_end = SteadyClock::now();
     timings.merge_sort_dedup_ms = elapsed_ms(t3e_start, t3e_end);
