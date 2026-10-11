@@ -1,3 +1,4 @@
+#include "dataset_generator.hpp"
 #include <iostream>
 #include <omp.h>
 
@@ -22,36 +23,57 @@ const char* get_cpp_standard_name(long standard_value) {
 int main() {
     std::cout << "===============================================================\n";
     std::cout << " Skew-Aware Adaptive Parallel Near-Duplicate Detection\n";
-    std::cout << " Phase 0: Environment & OpenMP Verification\n";
     std::cout << "===============================================================\n\n";
 
-    // 1. Report C++ Standard
-    std::cout << "[C++ Standard Check]\n";
+    // -------------------------------------------------------------
+    // Phase 0 Checks: Compiler, C++ Standard & OpenMP Runtime
+    // -------------------------------------------------------------
+    std::cout << "[Phase 0 Verification]\n";
     std::cout << "  __cplusplus macro value : " << __cplusplus << "\n";
-    std::cout << "  Active language standard: " << get_cpp_standard_name(__cplusplus) << "\n\n";
+    std::cout << "  Active language standard: " << get_cpp_standard_name(__cplusplus) << "\n";
+    std::cout << "  Logical processors      : " << omp_get_num_procs() << "\n";
+    std::cout << "  Max OpenMP thread pool  : " << omp_get_max_threads() << "\n";
 
-    // 2. Report Available Execution Resources via OpenMP API
-    int max_available_threads = omp_get_max_threads();
-    int processor_count = omp_get_num_procs();
-    std::cout << "[System Resource Discovery]\n";
-    std::cout << "  Logical processors detected : " << processor_count << "\n";
-    std::cout << "  Default max threads pool    : " << max_available_threads << "\n\n";
-
-    // 3. Execute an OpenMP Parallel Region
-    std::cout << "[OpenMP Team Verification]\n";
     int actual_team_size = 0;
-
     #pragma omp parallel
     {
-        // Only one thread records and reports the team size
         #pragma omp single
         {
             actual_team_size = omp_get_num_threads();
-            std::cout << "  Entered OpenMP parallel region.\n";
-            std::cout << "  Threads in active parallel team: " << actual_team_size << "\n";
+            std::cout << "  OpenMP active team size : " << actual_team_size << " threads\n";
         }
     }
+    std::cout << "  Phase 0 status          : PASS\n\n";
 
-    std::cout << "\n[Status] Phase 0 verification completed successfully.\n";
+    // -------------------------------------------------------------
+    // Phase 1 Demonstration: Synthetic Dataset Generation
+    // -------------------------------------------------------------
+    std::cout << "[Phase 1 Demonstration: Dataset Generation]\n";
+
+    // 1. Generate a Balanced Dataset
+    DatasetConfig balanced_cfg;
+    balanced_cfg.total_documents = 100;
+    balanced_cfg.min_words = 30;
+    balanced_cfg.max_words = 60;
+    balanced_cfg.exact_duplicate_ratio = 0.25;
+    balanced_cfg.modified_copy_ratio = 0.25;
+    balanced_cfg.unrelated_ratio = 0.10;
+    balanced_cfg.modification_rate = 0.15;
+    balanced_cfg.random_seed = 42;
+    balanced_cfg.profile = WorkloadProfile::Balanced;
+
+    std::vector<Document> balanced_dataset = generate_dataset(balanced_cfg);
+    DatasetSummary balanced_summary = summarize_dataset(balanced_dataset, balanced_cfg);
+    balanced_summary.print(std::cout);
+
+    // 2. Generate a Skewed Dataset (same seed, skewed distribution)
+    DatasetConfig skewed_cfg = balanced_cfg;
+    skewed_cfg.profile = WorkloadProfile::Skewed;
+
+    std::vector<Document> skewed_dataset = generate_dataset(skewed_cfg);
+    DatasetSummary skewed_summary = summarize_dataset(skewed_dataset, skewed_cfg);
+    skewed_summary.print(std::cout);
+
+    std::cout << "\n[Status] Phase 1 execution completed successfully.\n";
     return 0;
 }
