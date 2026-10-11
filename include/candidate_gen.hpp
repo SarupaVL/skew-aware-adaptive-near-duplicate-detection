@@ -118,6 +118,9 @@ struct PipelineResult {
     std::vector<BucketInfo> buckets;              ///< Non-empty bucket records.
     WorkloadStatistics workload_stats;            ///< Workload distribution statistics.
     StageTimings timings;                         ///< Stage timings in milliseconds.
+    int actual_thread_count{1};                   ///< Worker threads in team (1 for sequential).
+    std::vector<uint64_t> per_thread_pair_work;   ///< Estimated pair positions (W_t) assigned per worker thread.
+    std::vector<size_t> per_thread_units_processed; ///< Positive-work buckets/chunks processed per worker thread.
 };
 
 /**

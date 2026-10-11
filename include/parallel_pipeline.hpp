@@ -142,6 +142,8 @@ struct AdaptiveDiagnostics {
     int configured_thread_count{0};                                     ///< Thread count requested in AdaptiveConfig.
     int actual_thread_count{0};                                         ///< Actual OpenMP team size formed at runtime.
     uint64_t max_pair_task_size{kDefaultMaxPairTaskSize};               ///< Configured maximum pair positions per chunk.
+    std::vector<uint64_t> per_thread_pair_work;                         ///< Estimated pair positions (W_t) assigned per worker thread.
+    std::vector<size_t> per_thread_units_processed;                     ///< Total ordinary buckets + heavy chunks processed per worker thread.
 
     void print(std::ostream& os) const;
 };

@@ -53,6 +53,9 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
     result.fingerprints.reserve(num_docs);
 
     if (documents.empty()) {
+        result.actual_thread_count = 1;
+        result.per_thread_pair_work = {0ULL};
+        result.per_thread_units_processed = {0};
         auto pipeline_end = Clock::now();
         result.timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
             pipeline_end - pipeline_start
@@ -186,6 +189,7 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
     auto t3_start = Clock::now();
 
     std::vector<CandidatePair> raw_candidates;
+    size_t units_processed = 0;
 
     for (size_t band = 0; band < kNumBands; ++band) {
         for (size_t val = 0; val < 256; ++val) {
@@ -193,6 +197,7 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
             if (bucket_docs.size() < 2) {
                 continue;
             }
+            ++units_processed;
 
             // Generate all unordered pairs within this bucket
             for (size_t i = 0; i < bucket_docs.size(); ++i) {
@@ -208,6 +213,10 @@ PipelineResult run_sequential_pipeline(const std::vector<Document>& documents,
             }
         }
     }
+
+    result.actual_thread_count = 1;
+    result.per_thread_pair_work = {static_cast<uint64_t>(raw_candidates.size())};
+    result.per_thread_units_processed = {units_processed};
 
     // Sort and deduplicate candidate pairs deterministically
     std::sort(raw_candidates.begin(), raw_candidates.end());

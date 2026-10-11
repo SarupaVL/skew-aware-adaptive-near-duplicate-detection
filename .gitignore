@@ -27,3 +27,8 @@ data/*.bin
 !data/generator/
 *.log
 *.csv
+!results/
+!results/*.csv
+!results/*.svg
+!results/*.png
+

@@ -116,6 +116,9 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
     result.fingerprints.resize(num_docs);
 
     if (documents.empty()) {
+        result.actual_thread_count = 0;
+        result.per_thread_pair_work.assign(static_cast<size_t>(config.thread_count), 0ULL);
+        result.per_thread_units_processed.assign(static_cast<size_t>(config.thread_count), 0);
         auto pipeline_end = Clock::now();
         result.timings.total_pipeline_ms = std::chrono::duration<double, std::milli>(
             pipeline_end - pipeline_start
@@ -282,22 +285,28 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
 
     size_t num_active_buckets = active_buckets.size();
     std::vector<std::vector<CandidatePair>> per_thread_candidates(config.thread_count);
+    std::vector<size_t> per_thread_units(config.thread_count, 0);
+    int observed_team_size = config.thread_count;
 
     #pragma omp parallel num_threads(config.thread_count) default(none) \
-        shared(active_buckets, num_active_buckets, per_thread_candidates)
+        shared(active_buckets, num_active_buckets, per_thread_candidates, per_thread_units, observed_team_size)
     {
         int tid = omp_get_thread_num();
+        size_t local_units = 0;
 
         #pragma omp single
         {
             int actual_threads = omp_get_num_threads();
+            observed_team_size = actual_threads;
             if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
                 per_thread_candidates.resize(actual_threads);
+                per_thread_units.resize(actual_threads, 0);
             }
         }
 
         #pragma omp for schedule(runtime)
         for (size_t b = 0; b < num_active_buckets; ++b) {
+            ++local_units;
             const auto& bucket_docs = *active_buckets[b];
             size_t bsize = bucket_docs.size();
 
@@ -312,7 +321,16 @@ PipelineResult run_parallel_pipeline(const std::vector<Document>& documents,
                 }
             }
         }
+
+        per_thread_units[tid] = local_units;
     }
+
+    result.actual_thread_count = observed_team_size;
+    result.per_thread_pair_work.resize(per_thread_candidates.size(), 0ULL);
+    for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
+        result.per_thread_pair_work[t] = static_cast<uint64_t>(per_thread_candidates[t].size());
+    }
+    result.per_thread_units_processed = std::move(per_thread_units);
 
     // Merge per-thread candidate lists sequentially
     size_t total_raw_candidates = 0;
@@ -636,6 +654,11 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
             0.0, config.cv_threshold, &diag.decision_reason
         );
         diag.decision_reason += " (empty dataset; 0 positive-work buckets)";
+        result.actual_thread_count = 0;
+        result.per_thread_pair_work.assign(static_cast<size_t>(config.thread_count), 0ULL);
+        result.per_thread_units_processed.assign(static_cast<size_t>(config.thread_count), 0);
+        diag.per_thread_pair_work = result.per_thread_pair_work;
+        diag.per_thread_units_processed = result.per_thread_units_processed;
         auto decision_end = Clock::now();
 
         timings.adaptive_decision_ms = std::chrono::duration<double, std::milli>(
@@ -830,7 +853,9 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     ).count();
 
     // Preallocate per-thread candidate buffers shared across Stage 3b and Stage 3d
-    std::vector<std::vector<CandidatePair>> per_thread_candidates(config.thread_count);
+    size_t team_slots = static_cast<size_t>(std::max(config.thread_count, diag.actual_thread_count));
+    std::vector<std::vector<CandidatePair>> per_thread_candidates(team_slots);
+    std::vector<size_t> per_thread_units(team_slots, 0);
 
     // -------------------------------------------------------------
     // Stage 3b: Ordinary-Bucket Candidate Generation
@@ -844,20 +869,23 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         );
 
         #pragma omp parallel num_threads(config.thread_count) default(none) \
-            shared(ordinary_bucket_ptrs, num_ordinary, per_thread_candidates)
+            shared(ordinary_bucket_ptrs, num_ordinary, per_thread_candidates, per_thread_units)
         {
             int tid = omp_get_thread_num();
+            size_t local_units = 0;
 
             #pragma omp single
             {
                 int actual_threads = omp_get_num_threads();
                 if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
                     per_thread_candidates.resize(actual_threads);
+                    per_thread_units.resize(actual_threads, 0);
                 }
             }
 
             #pragma omp for schedule(runtime)
             for (size_t b = 0; b < num_ordinary; ++b) {
+                ++local_units;
                 const auto& bucket_docs = *ordinary_bucket_ptrs[b];
                 size_t bsize = bucket_docs.size();
 
@@ -872,6 +900,8 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
                     }
                 }
             }
+
+            per_thread_units[tid] += local_units;
         }
     }
 
@@ -920,20 +950,23 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
         const auto& heavy_chunks_ref = adaptive_res.heavy_chunks;
 
         #pragma omp parallel num_threads(config.thread_count) default(none) \
-            shared(heavy_chunks_ref, num_heavy_chunks, buckets_table, per_thread_candidates)
+            shared(heavy_chunks_ref, num_heavy_chunks, buckets_table, per_thread_candidates, per_thread_units)
         {
             int tid = omp_get_thread_num();
+            size_t local_units = 0;
 
             #pragma omp single
             {
                 int actual_threads = omp_get_num_threads();
                 if (actual_threads > static_cast<int>(per_thread_candidates.size())) {
                     per_thread_candidates.resize(actual_threads);
+                    per_thread_units.resize(actual_threads, 0);
                 }
             }
 
             #pragma omp for schedule(runtime)
             for (size_t c = 0; c < num_heavy_chunks; ++c) {
+                ++local_units;
                 const HeavyBucketChunk& chunk = heavy_chunks_ref[c];
                 const auto& bucket_docs = buckets_table[chunk.band_index][chunk.band_value];
                 size_t bsize = bucket_docs.size();
@@ -959,6 +992,8 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
                     }
                 }
             }
+
+            per_thread_units[tid] += local_units;
         }
     }
 
@@ -971,6 +1006,15 @@ AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& docume
     // Stage 3e: Sequential Merge, Sort & Deduplication
     // -------------------------------------------------------------
     auto t3e_start = Clock::now();
+
+    result.actual_thread_count = diag.actual_thread_count;
+    result.per_thread_pair_work.resize(per_thread_candidates.size(), 0ULL);
+    for (size_t t = 0; t < per_thread_candidates.size(); ++t) {
+        result.per_thread_pair_work[t] = static_cast<uint64_t>(per_thread_candidates[t].size());
+    }
+    result.per_thread_units_processed = std::move(per_thread_units);
+    diag.per_thread_pair_work = result.per_thread_pair_work;
+    diag.per_thread_units_processed = result.per_thread_units_processed;
 
     size_t total_raw_candidates = 0;
     for (const auto& pt_vec : per_thread_candidates) {

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(SkewAwareNearDuplicateDetection
-    VERSION 0.5.0
+    VERSION 0.6.0
     LANGUAGES CXX
 )
 
@@ -24,12 +24,13 @@ endif()
 # Common include directories
 include_directories(include)
 
-# Reusable core library (data model, generator, SimHash, sequential, parallel & adaptive pipelines)
+# Reusable core library (data model, generator, SimHash, sequential, parallel, adaptive & benchmark)
 add_library(hpc_core STATIC
     src/dataset_generator.cpp
     src/simhash.cpp
     src/candidate_gen.cpp
     src/parallel_pipeline.cpp
+    src/benchmark.cpp
 )
 
 target_include_directories(hpc_core PUBLIC
@@ -40,12 +41,23 @@ target_link_libraries(hpc_core PUBLIC
     OpenMP::OpenMP_CXX
 )
 
-# Main executable
+# Main demonstration executable
 add_executable(hpc_near_duplicate
     src/main.cpp
 )
 
 target_link_libraries(hpc_near_duplicate
+    PRIVATE
+        hpc_core
+        OpenMP::OpenMP_CXX
+)
+
+# Phase 6 Reproducible Benchmark Driver executable
+add_executable(hpc_benchmark
+    src/benchmark_main.cpp
+)
+
+target_link_libraries(hpc_benchmark
     PRIVATE
         hpc_core
         OpenMP::OpenMP_CXX
@@ -88,3 +100,11 @@ add_executable(test_adaptive_pipeline
 )
 target_link_libraries(test_adaptive_pipeline PRIVATE hpc_core OpenMP::OpenMP_CXX)
 add_test(NAME AdaptivePipelineTest COMMAND test_adaptive_pipeline)
+
+# Test 6: Reproducible Benchmarking & Metrics Test Suite (Phase 6)
+add_executable(test_benchmark
+    tests/test_benchmark.cpp
+)
+target_link_libraries(test_benchmark PRIVATE hpc_core OpenMP::OpenMP_CXX)
+add_test(NAME BenchmarkTest COMMAND test_benchmark)
+
