@@ -77,19 +77,44 @@ void test_simhash_empty_text() {
 }
 
 void test_simhash_short_text() {
-    // Fewer tokens than default shingle size (3)
+    // 1. One-token document (tokens < shingle_size)
     std::string one_token = "algorithm";
-    std::string two_tokens = "parallel algorithm";
+    auto tokens_1 = tokenize_text(one_token);
+    check(tokens_1.size() == 1, "test_tokens_1_count", "1 token expected.");
+    auto shingles_1 = create_shingles(tokens_1, 3);
+    check(shingles_1.size() == 1 && shingles_1[0] == "algorithm",
+          "test_shingles_1_fallback", "Fallback shingle must equal single token.");
 
     uint64_t h1 = compute_simhash(one_token, 3);
-    uint64_t h2 = compute_simhash(two_tokens, 3);
-
     check(h1 != 0ULL, "test_simhash_short_text_1", "1-word text must produce valid non-zero fingerprint.");
-    check(h2 != 0ULL, "test_simhash_short_text_2", "2-word text must produce valid non-zero fingerprint.");
-
-    // Repeating must still be deterministic
     check(h1 == compute_simhash(one_token, 3), "test_simhash_short_deterministic_1", "Must be deterministic.");
+    // For a single shingle, SimHash bit i equals bit i of FNV-1a hash
+    check(h1 == fnv1a_hash64("algorithm"), "test_simhash_1_token_equals_hash",
+          "Single-token SimHash must match raw shingle hash directly.");
+
+    // 2. Two-token document (tokens < shingle_size)
+    std::string two_tokens = "parallel algorithm";
+    auto tokens_2 = tokenize_text(two_tokens);
+    check(tokens_2.size() == 2, "test_tokens_2_count", "2 tokens expected.");
+    auto shingles_2 = create_shingles(tokens_2, 3);
+    check(shingles_2.size() == 1 && shingles_2[0] == "parallel algorithm",
+          "test_shingles_2_fallback", "Fallback shingle must join available tokens.");
+
+    uint64_t h2 = compute_simhash(two_tokens, 3);
+    check(h2 != 0ULL, "test_simhash_short_text_2", "2-word text must produce valid non-zero fingerprint.");
     check(h2 == compute_simhash(two_tokens, 3), "test_simhash_short_deterministic_2", "Must be deterministic.");
+    check(h2 == fnv1a_hash64("parallel algorithm"), "test_simhash_2_token_equals_hash",
+          "Two-token fallback SimHash must match raw shingle hash.");
+
+    // 3. Exactly three-token document (tokens == shingle_size)
+    std::string three_tokens = "parallel algorithm design";
+    auto tokens_3 = tokenize_text(three_tokens);
+    auto shingles_3 = create_shingles(tokens_3, 3);
+    check(shingles_3.size() == 1 && shingles_3[0] == "parallel algorithm design",
+          "test_shingles_3_exact", "Exactly 3 tokens with k=3 must yield exactly 1 standard shingle.");
+    uint64_t h3 = compute_simhash(three_tokens, 3);
+    check(h3 != 0ULL && h3 == fnv1a_hash64("parallel algorithm design"),
+          "test_simhash_3_tokens_exact", "3-token shingle SimHash must match shingle hash.");
 }
 
 void test_simhash_exact_copy() {

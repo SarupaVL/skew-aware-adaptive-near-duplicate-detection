@@ -59,9 +59,9 @@ std::vector<std::string> create_shingles(const std::vector<std::string>& tokens,
         return {};
     }
 
-    // Edge case: if token count is less than shingle size, concatenate all
+    // Edge case: if token count is strictly less than shingle size, concatenate all
     // available tokens into a single fallback shingle so the document is still fingerprinted
-    if (tokens.size() <= shingle_size) {
+    if (tokens.size() < shingle_size) {
         std::string fallback;
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (i > 0) fallback += ' ';
