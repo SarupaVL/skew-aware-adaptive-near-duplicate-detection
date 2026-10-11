@@ -101,9 +101,9 @@ int main() {
     std::cout << "----------------------------------------------------------------------------------\n\n";
 
     // -------------------------------------------------------------
-    // Phase 3 & 4: Sequential vs. OpenMP Parallel Scheduling Baselines
+    // Phase 3, 4 & 5: Sequential, Fixed Baselines & Adaptive Pipeline
     // -------------------------------------------------------------
-    std::cout << "[Phase 3 & 4 Demonstration: Sequential vs. OpenMP Parallel Baselines]\n";
+    std::cout << "[Phase 3, 4 & 5 Demonstration: Sequential, Fixed Baselines & Adaptive Scheduling]\n";
 
     PipelineConfig pipe_cfg;
     pipe_cfg.shingle_size = 3;
@@ -118,7 +118,7 @@ int main() {
     std::cout << "  Sequential Total Runtime  : " << std::fixed << std::setprecision(3)
               << seq_res.timings.total_pipeline_ms << " ms\n";
 
-    // 2. Parallel Baseline Runs: Static, Dynamic, and Guided Scheduling
+    // 2. Parallel Runs: Fixed Baselines (Static, Dynamic, Guided) + Adaptive Policy
     int demo_threads = std::min(4, omp_get_max_threads());
     std::cout << "\n>>> Running OpenMP Parallel Pipelines (" << demo_threads << " threads)...\n";
 
@@ -156,10 +156,39 @@ int main() {
                   << " | " << (parity_ok ? "EXACT MATCH" : "MISMATCH!")
                   << "\n";
     }
+
+    // 3. Workload-Aware Adaptive Pipeline Run (Phase 5)
+    AdaptiveConfig adap_cfg;
+    adap_cfg.base_config = pipe_cfg;
+    adap_cfg.thread_count = demo_threads;
+    adap_cfg.cv_threshold = kDefaultCvThreshold;                  // 1.0
+    adap_cfg.oversized_bucket_multiplier = kDefaultOversizedMultiplier; // 4.0
+    adap_cfg.max_pair_task_size = kDefaultMaxPairTaskSize;        // 4096
+
+    AdaptivePipelineResult adap_res = run_adaptive_pipeline(dataset, adap_cfg);
+    const PipelineResult& adap_pipe = adap_res.pipeline_result;
+
+    bool adap_parity_ok = (seq_res.document_ids == adap_pipe.document_ids) &&
+                          (seq_res.fingerprints == adap_pipe.fingerprints) &&
+                          (seq_res.candidate_pairs == adap_pipe.candidate_pairs) &&
+                          (seq_res.verified_pairs == adap_pipe.verified_pairs);
+
+    std::cout << " " << std::setw(15) << std::left << "Adaptive"
+              << " | " << std::setw(5) << adap_cfg.max_pair_task_size
+              << " | " << std::setw(9) << std::right << adap_pipe.timings.fingerprinting_ms << " ms"
+              << " | " << std::setw(11) << adap_pipe.timings.candidate_generation_dedup_ms << " ms"
+              << " | " << std::setw(10) << adap_pipe.timings.verification_ms << " ms"
+              << " | " << std::setw(8) << adap_pipe.timings.total_pipeline_ms << " ms"
+              << " | " << (adap_parity_ok ? "EXACT MATCH" : "MISMATCH!")
+              << "\n";
     std::cout << "--------------------------------------------------------------------------------------------\n";
 
-    std::cout << "\nWorkload Statistics (Identical across Sequential and Parallel):\n";
+    std::cout << "\nWorkload Statistics (Identical across Sequential, Fixed, and Adaptive):\n";
     seq_res.workload_stats.print(std::cout);
+
+    std::cout << "\n[Phase 5 Adaptive Diagnostics & Stage Timings]\n";
+    adap_res.diagnostics.print(std::cout);
+    adap_res.adaptive_timings.print(std::cout);
 
     std::cout << "\n[Status] Execution completed successfully.\n";
     return 0;

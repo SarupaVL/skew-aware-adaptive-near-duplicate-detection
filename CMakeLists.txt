@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(SkewAwareNearDuplicateDetection
-    VERSION 0.4.0
+    VERSION 0.5.0
     LANGUAGES CXX
 )
 
@@ -24,7 +24,7 @@ endif()
 # Common include directories
 include_directories(include)
 
-# Reusable core library (data model, generator, SimHash, sequential & parallel pipelines)
+# Reusable core library (data model, generator, SimHash, sequential, parallel & adaptive pipelines)
 add_library(hpc_core STATIC
     src/dataset_generator.cpp
     src/simhash.cpp
@@ -81,3 +81,10 @@ add_executable(test_parallel_pipeline
 )
 target_link_libraries(test_parallel_pipeline PRIVATE hpc_core OpenMP::OpenMP_CXX)
 add_test(NAME ParallelPipelineTest COMMAND test_parallel_pipeline)
+
+# Test 5: Workload-Aware Adaptive Pipeline Test Suite (Phase 5)
+add_executable(test_adaptive_pipeline
+    tests/test_adaptive_pipeline.cpp
+)
+target_link_libraries(test_adaptive_pipeline PRIVATE hpc_core OpenMP::OpenMP_CXX)
+add_test(NAME AdaptivePipelineTest COMMAND test_adaptive_pipeline)

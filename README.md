@@ -6,16 +6,17 @@ This project investigates CPU-based near-duplicate document detection using SimH
 
 ---
 
-## Current Status: Phase 4 Completed
+## Current Status: Phase 5 Completed
 
 The project has completed:
 - **Phase 0:** Environment inspection, C++17 validation, and OpenMP runtime verification.
 - **Phase 1:** In-memory document data model, ground-truth duplicate cluster semantics, and deterministic synthetic dataset generator.
 - **Phase 2:** 64-bit SimHash locality-sensitive fingerprinting, deterministic FNV-1a hashing, token shingling, and bitwise Hamming distance computation.
 - **Phase 3:** Deterministic sequential near-duplicate detection pipeline: 8-band / 8-bit candidate generation, pair deduplication, Hamming-distance verification, bucket workload statistics, and stage timings.
-- **Phase 4:** OpenMP parallelization and scheduling baselines (`static`, `dynamic`, `guided`), race-free thread-local pair accumulation, deterministic output matching sequential ground truth, and configurable thread scaling.
+- **Phase 4:** OpenMP parallelization and fixed scheduling baselines (`static`, `dynamic`, `guided`), race-free per-thread pair accumulation, deterministic output matching sequential ground truth, and configurable thread scaling.
+- **Phase 5:** Workload-aware adaptive scheduling and heavy-bucket splitting into bounded pair-work chunks (`4,096` pairs default), adaptive diagnostics, non-overlapping stage timings, and correctness verification.
 
-*(Adaptive scheduling—workload-aware task splitting of large candidate groups—is part of subsequent phases and is not yet implemented.)*
+*(Systematic performance benchmarking experiments across dataset scales, skew levels, and thread counts are reserved for the next phase.)*
 
 ---
 
@@ -179,7 +180,80 @@ Because per-thread accumulation orders depend on dynamic thread scheduling, both
 
 > [!NOTE]
 > **Performance Note on Small Workloads:**  
-> Parallel speedup is not guaranteed for small document collections ($N < 500$) due to thread creation and synchronization overhead. Measurable speedup becomes evident on larger corpuses or computationally heavy verification stages.
+> Parallel speedup is not guaranteed for small document collections ($N < 500$) due to thread creation and synchronization overhead. Measurable speedup and load-balance trade-offs must be evaluated experimentally on larger workloads.
+
+---
+
+## Workload-Aware Adaptive Scheduling & Heavy-Bucket Splitting (Phase 5)
+
+Phase 5 (`include/parallel_pipeline.hpp`, `src/parallel_pipeline.cpp`) introduces an explicit adaptive pipeline (`run_adaptive_pipeline`) alongside the existing sequential reference (`run_sequential_pipeline`) and fixed OpenMP scheduling baselines (`run_parallel_pipeline` with `Static`, `Dynamic`, or `Guided`).
+
+### 1. Fixed Baselines vs. Adaptive Scheduling
+- **Fixed Baselines (`run_parallel_pipeline`):** Apply a single predetermined OpenMP loop schedule (`Static`, `Dynamic`, or `Guided`) across all active buckets as indivisible loop iterations.
+- **Adaptive Scheduling (`run_adaptive_pipeline`):** Inspects the actual SimHash bucket distribution at runtime (never relying on synthetic generator labels) to:
+  1. Select `Static` vs. `Dynamic` scheduling for ordinary buckets based on the measured Coefficient of Variation ($\text{CV}$).
+  2. Partition oversized ("heavy") buckets into bounded pair-work chunks so no single bucket monopolizes a thread.
+
+### 2. Workload Measurement & Adaptive Decision Rule
+For each occupied bucket $i$ containing $k_i$ documents, the estimated pairwise comparison work is:
+
+$$W_i = \frac{k_i(k_i - 1)}{2}$$
+
+Across all buckets with positive pair work ($k_i \ge 2$, $W_i > 0$), the pipeline computes the mean positive pair work $\overline{W}$ and the population standard deviation $\sigma$, yielding the **Coefficient of Variation**:
+
+$$\text{CV} = \frac{\sigma}{\overline{W}}$$
+
+(If no buckets have $k_i \ge 2$, $\overline{W} = 0.0$ and $\text{CV} = 0.0$.)
+
+The baseline schedule for **ordinary buckets** is chosen by `select_ordinary_schedule_policy()`:
+- If $\text{CV} \le \text{cv\_threshold}$ (default `1.0`): select **`SchedulePolicy::Static`**.
+- If $\text{CV} > \text{cv\_threshold}$ (default `1.0`): select **`SchedulePolicy::Dynamic`**.
+- `Guided` scheduling is never silently substituted by the adaptive rule; it remains strictly a fixed baseline for comparison.
+
+### 3. Oversized-Bucket Identification & Heavy-Bucket Splitting
+A positive-work bucket is classified as **oversized** when its pair work strictly exceeds a configurable multiple of the mean positive pair work:
+
+$$W_i > \text{oversized\_bucket\_multiplier} \times \overline{W}$$
+
+where `oversized_bucket_multiplier` defaults to **`4.0`** (`kDefaultOversizedMultiplier = 4.0`). If there are no positive-work buckets, no buckets are classified as oversized.
+
+Each positive-work bucket is processed either as an **ordinary bucket** ($W_i \le 4.0 \times \overline{W}$) or as **split heavy-bucket work** ($W_i > 4.0 \times \overline{W}$), never both:
+- **Ordinary buckets** are processed in parallel under the selected baseline schedule (`Static` or `Dynamic`).
+- **Oversized buckets** are split by `split_bucket_into_chunks()` into compact `HeavyBucketChunk` descriptors containing at most **`max_pair_task_size` = 4,096** pair positions (`kDefaultMaxPairTaskSize = 4096`). For example, a bucket with $10,000$ pair positions and a limit of $4,096$ produces 3 chunks of sizes $4,096$, $4,096$, and $1,808$.
+- All generated heavy-bucket chunks are processed in parallel using **OpenMP `Dynamic` scheduling** (`chunk_size = 1`).
+
+### 4. Compact Pair-Position Mapping (`unrank_pair_position`)
+To avoid materializing a large intermediate array of all pairs before scheduling, each `HeavyBucketChunk` stores only `(band_index, band_value, start_pair_pos, end_pair_pos)`.
+
+Within a bucket of size $k$, unordered index pairs $(i, j)$ with $0 \le i < j < k$ are ordered lexicographically:
+- Row $i \in [0, k - 2]$ contains $(k - 1 - i)$ pairs and starts at linear pair position:
+  $$\text{row\_start}(i, k) = \sum_{r=0}^{i-1} (k - 1 - r) = \frac{i(2k - 1 - i)}{2}$$
+- At the beginning of a chunk `[start_pair_pos, end_pair_pos)`, `unrank_pair_position(k, start_pair_pos)` uses integer binary search over $i \in [0, k - 2]$ to find the largest row with $\text{row\_start}(i, k) \le \text{start\_pair\_pos}$ and computes $j = (i + 1) + (\text{start\_pair\_pos} - \text{row\_start}(i, k))$.
+- Subsequent pair positions within the chunk advance $(i, j)$ in $O(1)$ time (`++j; if (j >= k) { ++i; j = i + 1; }`).
+
+### 5. Adaptive Configuration, Diagnostics & Non-Overlapping Timings
+```cpp
+// include/parallel_pipeline.hpp
+struct AdaptiveConfig {
+    PipelineConfig base_config{};                        // Shingle size & Hamming threshold
+    int thread_count{4};                                 // Requested OpenMP threads (> 0)
+    double cv_threshold{1.0};                            // Static (<=) vs Dynamic (>) threshold (>= 0, finite)
+    double oversized_bucket_multiplier{4.0};             // Heavy-bucket multiplier (> 0, finite)
+    uint64_t max_pair_task_size{4096};                   // Max pair positions per heavy chunk (> 0)
+    int ordinary_chunk_size{0};                          // OpenMP chunk size for ordinary buckets (>= 0)
+
+    void validate() const;
+};
+
+AdaptivePipelineResult run_adaptive_pipeline(const std::vector<Document>& documents,
+                                             const AdaptiveConfig& config = AdaptiveConfig{});
+```
+- **Diagnostics (`AdaptiveDiagnostics`):** Reports `configured_thread_count` vs. measured `actual_thread_count`, `observed_cv`, `selected_ordinary_policy`, `decision_reason`, `occupied_buckets`, `positive_work_buckets`, `ordinary_buckets`, `oversized_buckets`, `oversized_pair_work`, `heavy_bucket_chunks`, and `max_generated_chunk_size`.
+- **Stage Timings (`AdaptiveStageTimings`):** Records strictly non-overlapping wall-clock durations for (1) `fingerprinting_ms`, (2) `bucket_construction_stats_ms`, (3a) `adaptive_decision_ms`, (3b) `ordinary_candidate_gen_ms`, (3c) `heavy_chunk_generation_ms`, (3d) `heavy_pair_processing_ms`, (3e) `merge_sort_dedup_ms`, (4) `verification_ms`, and `total_pipeline_ms`.
+
+> [!IMPORTANT]
+> **Experimental Evaluation Scope:**  
+> Implementing adaptive scheduling and heavy-bucket splitting establishes the mechanism and correctness parity with the sequential reference. Actual runtime and load-balance benefits compared with fixed `static`, `dynamic`, and `guided` baselines remain to be evaluated experimentally across dataset sizes, skew profiles, and thread counts in the next phase.
 
 ---
 
@@ -223,14 +297,16 @@ cmake --build build-release
 
 ### 4. Run Automated Tests
 ```powershell
-# Run all tests via CTest
+# Run all 5 test suites via CTest
 ctest --test-dir build --output-on-failure
+ctest --test-dir build-release --output-on-failure
 
 # Or run individual test suites directly
 .\build\test_dataset_generator.exe
 .\build\test_simhash.exe
 .\build\test_candidate_gen.exe
 .\build\test_parallel_pipeline.exe
+.\build\test_adaptive_pipeline.exe
 ```
 
 ### 5. Run the Demonstration Program
@@ -287,23 +363,24 @@ Fingerprinting sample documents from generated dataset:
   3 |     4 | Original      | 0x7ee5533a1895b04e | size array reproducibility cache deterministic...
 ----------------------------------------------------------------------------------
 
-[Phase 3 & 4 Demonstration: Sequential vs. OpenMP Parallel Baselines]
+[Phase 3, 4 & 5 Demonstration: Sequential, Fixed Baselines & Adaptive Scheduling]
 
 >>> Running Sequential Reference Pipeline...
   Candidate Pairs Generated : 702
   Verified Near-Duplicates  : 50
-  Sequential Total Runtime  : 2.558 ms
+  Sequential Total Runtime  : 3.249 ms
 
 >>> Running OpenMP Parallel Pipelines (4 threads)...
 --------------------------------------------------------------------------------------------
  Schedule Policy | Chunk | Fingerprint | Candidate Gen | Verification | Total Time | Parity 
 --------------------------------------------------------------------------------------------
- Static          | 0     |     1.053 ms |       0.269 ms |      0.083 ms |    1.571 ms | EXACT MATCH
- Dynamic         | 2     |     0.751 ms |       0.172 ms |      0.115 ms |    1.203 ms | EXACT MATCH
- Guided          | 2     |     0.803 ms |       0.210 ms |      0.115 ms |    1.270 ms | EXACT MATCH
+ Static          | 0     |     1.355 ms |       0.206 ms |      0.112 ms |    1.871 ms | EXACT MATCH
+ Dynamic         | 2     |     1.016 ms |       0.281 ms |      0.144 ms |    1.680 ms | EXACT MATCH
+ Guided          | 2     |     1.087 ms |       0.272 ms |      0.119 ms |    1.732 ms | EXACT MATCH
+ Adaptive        | 4096  |     1.025 ms |       0.398 ms |      0.125 ms |    1.760 ms | EXACT MATCH
 --------------------------------------------------------------------------------------------
 
-Workload Statistics (Identical across Sequential and Parallel):
+Workload Statistics (Identical across Sequential, Fixed, and Adaptive):
 ---------------------------------------------------------
  SimHash Bucket Workload Statistics (8 bands x 8 bits)
 ---------------------------------------------------------
@@ -314,6 +391,40 @@ Workload Statistics (Identical across Sequential and Parallel):
   Max Estimated Bucket Pair Work    : 21
   Mean Estimated Pair Work (k >= 2) : 2.33
   Coefficient of Variation (CV)     : 1.18
+---------------------------------------------------------
+
+[Phase 5 Adaptive Diagnostics & Stage Timings]
+---------------------------------------------------------
+ Adaptive Scheduling Diagnostics
+---------------------------------------------------------
+  Configured Thread Count           : 4
+  Actual OpenMP Team Size           : 4
+  Observed Bucket Pair-Work CV      : 1.1800 (Threshold: 1.0000)
+  Selected Ordinary-Bucket Policy   : Dynamic
+  Decision Reason                   : CV (1.1800) > threshold (1.0000) -> Dynamic schedule for ordinary buckets
+  Occupied Buckets (k >= 1)         : 893
+  Positive-Work Buckets (k >= 2)    : 464
+  Mean Positive Pair Work (W_bar)   : 2.33
+  Oversized Threshold (4.00 x W_bar) : 9.32
+  Ordinary Positive-Work Buckets    : 440 (Pair Work: 798)
+  Oversized Buckets                 : 24 (Pair Work: 283)
+  Task-Size Limit (Pairs / Chunk)   : 4096
+  Generated Heavy-Bucket Chunks     : 24
+  Max Generated Chunk Size          : 21
+---------------------------------------------------------
+---------------------------------------------------------
+ Adaptive Pipeline Stage Timings (Non-Overlapping)
+---------------------------------------------------------
+  1. Fingerprinting                 : 1.025 ms
+  2. Bucket Construction & Stats    : 0.194 ms
+  3a. Adaptive Decision & Classify  : 0.054 ms
+  3b. Ordinary-Bucket Candidate Gen : 0.143 ms
+  3c. Heavy-Bucket Chunk Generation : 0.004 ms
+  3d. Heavy-Bucket Pair Processing  : 0.116 ms
+  3e. Merge, Sort & Deduplication   : 0.080 ms
+  4. Hamming Distance Verification  : 0.125 ms
+  -------------------------------------------------------
+  Total Adaptive Pipeline Runtime   : 1.760 ms
 ---------------------------------------------------------
 
 [Status] Execution completed successfully.
