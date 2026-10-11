@@ -53,6 +53,10 @@ The generator (`include/dataset_generator.hpp`, `src/dataset_generator.cpp`) pro
 - **`Balanced` Profile:** Distributes exact and modified copies uniformly across original documents (round-robin). All duplicate clusters have similar, small group sizes (e.g., 2–3 documents per group).
 - **`Skewed` Profile:** Distributes copies according to a Zipfian power-law weighting ($w_i = 1 / (i + 1)^2$). A small number of "heavy-hitter" original documents accumulate the vast majority of copies, producing a severe workload skew (e.g., one group containing 30+ documents while others contain 1 or 2).
 
+> [!NOTE]
+> **Important Distinction on Workload Scope:**  
+> In Phase 1, the `Balanced` and `Skewed` profiles govern strictly the distribution and sizes of **ground-truth duplicate groups**. They do **not** dictate the downstream SimHash candidate bucket distribution. The actual bucket workloads and pairwise candidate comparison counts will be experimentally measured once SimHash fingerprinting and candidate band generation are implemented in subsequent phases.
+
 ### Deterministic Reproducibility
 The generator uses `std::mt19937_64` initialized with `random_seed`. For identical configurations and seeds, it produces bitwise-identical documents, texts, IDs, and ground-truth group assignments.
 
