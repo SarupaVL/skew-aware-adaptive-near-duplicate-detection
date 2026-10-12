@@ -1,0 +1,368 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{hyperref}
+
+\DeclareUnicodeCharacter{2500}{\rule[0.5ex]{0.5em}{0.6pt}}
+
+% Colors for clean academic styling
+\definecolor{primaryblue}{RGB}{20, 56, 110}
+\definecolor{accentblue}{RGB}{43, 92, 165}
+\definecolor{codebg}{RGB}{245, 247, 250}
+\definecolor{quoteborder}{RGB}{43, 92, 165}
+\definecolor{quotebg}{RGB}{248, 250, 253}
+\definecolor{rulecolor}{RGB}{210, 216, 224}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=primaryblue,
+    citecolor=primaryblue,
+    urlcolor=accentblue,
+    pdftitle={Review 1: High Performance Computing Course Project - Skew-Aware Adaptive Parallel Near-Duplicate Detection on Multicore CPUs},
+    pdfauthor={Lakshmi Sarupa Venkadesh (23BCE0463)}
+}
+
+% Paragraph spacing and indentation
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.55em}
+\emergencystretch=3em
+\renewcommand{\_}{\textunderscore\allowbreak}
+\setlist[itemize]{topsep=0.25em, itemsep=0.25em, leftmargin=1.6em}
+\setlist[enumerate]{topsep=0.25em, itemsep=0.25em, leftmargin=1.8em}
+
+% Section heading formatting
+\titleformat{\section}
+  {\normalfont\Large\bfseries\color{primaryblue}}
+  {}{0em}{}[\vspace{2pt}{\color{rulecolor}\titlerule[0.8pt]}]
+\titlespacing*{\section}{0pt}{1.4em}{0.6em}
+
+\titleformat{\subsection}
+  {\normalfont\large\bfseries\color{primaryblue!90!black}}
+  {}{0em}{}
+\titlespacing*{\subsection}{0pt}{1.0em}{0.35em}
+
+\titleformat{\subsubsection}
+  {\normalfont\normalsize\bfseries\color{black!85}}
+  {}{0em}{}
+\titlespacing*{\subsubsection}{0pt}{0.75em}{0.25em}
+
+% Header and Footer
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{black!65}HIGH PERFORMANCE COMPUTING (BCSE414L) --- Review 1}
+\fancyhead[R]{\small\color{black!65}Group 29 --- 23BCE0463}
+\fancyfoot[C]{\small\color{black!65}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Literature survey blockquote environment
+\newenvironment{litquote}{%
+  \par\vspace{0.15em}%
+  \noindent\kern0.2em\textcolor{quoteborder}{\vrule width 2.5pt}\kern0.85em%
+  \begin{minipage}{\dimexpr\textwidth-1.3em\relax}%
+  \itshape\color{black!88}%
+}{%
+  \end{minipage}\par\vspace{0.35em}%
+}
+
+% Table of Contents styling and section macros
+\renewcommand{\contentsname}{Table of Contents}
+\makeatletter
+\renewcommand*\l@section[2]{%
+  \ifnum \c@tocdepth >\z@
+    \addpenalty\@secpenalty
+    \addvspace{0.55em \@plus\p@}%
+    \setlength\@tempdima{1.5em}%
+    \begingroup
+      \parindent \z@ \rightskip \@pnumwidth
+      \parfillskip -\@pnumwidth
+      \leavevmode \bfseries\color{primaryblue}%
+      \advance\leftskip\@tempdima
+      \hskip -\leftskip
+      #1\nobreak\
+      \leaders\hbox{$\m@th\mkern \@dotsep mu\hbox{.}\mkern \@dotsep mu$}\hfill
+      \nobreak\hb@xt@\@pnumwidth{\hss #2}\par
+    \endgroup
+  \fi}
+\renewcommand*\l@subsection{\@dottedtocline{2}{1.6em}{2.3em}}
+\makeatother
+
+\newcommand{\covertitleheading}[1]{%
+  \phantomsection%
+  \addcontentsline{toc}{section}{#1}%
+  #1%
+}
+\newcommand{\covergroupheading}[1]{%
+  \phantomsection%
+  \addcontentsline{toc}{section}{#1}%
+  #1%
+}
+\newcommand{\tocsection}[1]{%
+  \phantomsection%
+  \section*{#1}%
+  \addcontentsline{toc}{section}{#1}%
+}
+\newcommand{\tocsubsection}[1]{%
+  \phantomsection%
+  \subsection*{#1}%
+  \addcontentsline{toc}{subsection}{#1}%
+}
+
+\begin{document}
+\sloppy
+
+% Formal Cover Page
+\begin{titlepage}
+\centering
+\vspace*{0.3cm}
+{\color{primaryblue}\rule{\textwidth}{2pt}}\\[3pt]
+{\color{accentblue}\rule{\textwidth}{0.6pt}}\\[1.1cm]
+
+{\LARGE\bfseries\color{primaryblue} SCHOOL OF COMPUTER SCIENCE AND ENGINEERING}\\[0.55cm]
+{\Large\bfseries\color{accentblue} HIGH PERFORMANCE COMPUTING (BCSE414L)}\\[0.45cm]
+{\large\bfseries\color{black!75} Review 1: High Performance Computing Course Project}\\[1.2cm]
+
+\fcolorbox{primaryblue}{codebg}{%
+    \parbox{0.92\textwidth}{%
+        \centering\vspace{0.65cm}
+        {\normalsize\bfseries\color{accentblue}\covertitleheading{1. Title}}\\[0.45cm]
+        {\huge\bfseries\color{primaryblue} Skew-Aware Adaptive Parallel\\[0.22em] Near-Duplicate Detection on\\[0.22em] Multicore CPUs}
+        \vspace{0.65cm}
+    }%
+}\\[1.4cm]
+
+\fcolorbox{rulecolor}{white}{%
+    \parbox{0.80\textwidth}{%
+        \vspace{0.35cm}
+        \begin{center}
+            {\large\bfseries\color{primaryblue}\covergroupheading{Group Details}}\\[0.25cm]
+            {\color{rulecolor}\rule{0.88\linewidth}{0.6pt}}\\[0.3cm]
+            \renewcommand{\arraystretch}{1.45}
+            \begin{tabular}{@{} >{\bfseries\color{primaryblue}}l @{\hspace{1.8em}} l @{}}
+                Group Number: & 29 \\
+                Submitted By: & Lakshmi Sarupa Venkadesh \\
+                Register No.: & \texttt{23BCE0463} \\
+                Course Code: & \texttt{BCSE414L} \\
+                Faculty Guide: & Vimala Devi K. \\
+                Academic Year: & 2026--27 \\
+            \end{tabular}
+        \end{center}
+        \vspace{0.3cm}
+    }%
+}
+
+\vfill
+{\color{accentblue}\rule{\textwidth}{0.6pt}}\\[3pt]
+{\color{primaryblue}\rule{\textwidth}{2pt}}
+\end{titlepage}
+
+% Professional Table of Contents Page
+\setcounter{page}{2}
+{\setlength{\parskip}{0.15em}\tableofcontents}
+\clearpage
+
+\tocsection{2. Abstract}
+
+Near-duplicate detection is the problem of finding documents in a collection that have the same or almost the same text. Comparing every document with every other document takes too much time as the dataset grows. Fingerprinting methods help reduce the number of comparisons by grouping likely matches into buckets, but these buckets often end up with very uneven sizes. This creates a serious load imbalance when the work is split across CPU cores using simple parallel loops.
+
+This project proposes a parallel near-duplicate detection system on the CPU using SimHash fingerprinting and OpenMP. The system will group documents into candidate pairs using fingerprint bands and check those pairs using Hamming distance. A single-threaded sequential version will be built first as a baseline. Standard OpenMP loop schedules (\texttt{static}, \texttt{dynamic}, and \texttt{guided}) will then be compared against a workload-aware adaptive scheduling approach that estimates the work inside each candidate bucket and splits up very large buckets across threads.
+
+The system will be written in C++17 with OpenMP and tested on synthetic datasets with controllable skew. Experiments will vary the number of documents, the level of skew, the number of threads, and the scheduling policy. The evaluation will measure execution time, speedup, parallel efficiency, thread load balance, memory usage, and detection accuracy to see when workload-aware scheduling improves performance on a multicore CPU.
+
+\tocsection{3. Introduction}
+
+\tocsubsection{3.1 Background and Motivation}
+Large document collections, such as web pages, digital libraries, legal archives, and medical records, often contain many duplicate or near-duplicate files caused by copying, shared templates, and minor edits [1], [4], [5]. Finding these near-duplicates quickly is important for saving storage space, improving search results, and cleaning datasets before analysis.
+
+\tocsubsection{3.2 The Pairwise Comparison Bottleneck}
+For a collection of $N$ documents, checking every possible pair requires $\frac{N(N-1)}{2} = \mathcal{O}(N^2)$ comparisons. As $N$ gets larger, comparing all pairs directly becomes too slow. Locality-Sensitive Hashing (LSH) methods such as MinHash [1] and Charikar's SimHash [2] solve this by turning each document into a short binary fingerprint where similar documents have similar fingerprints. By splitting each fingerprint into bands, only documents that match in at least one band need to be compared as candidate pairs [4].
+
+\tocsubsection{3.3 The Workload Skew Problem on Multicore CPUs}
+Even though banding filters out most unrelated pairs, real document collections rarely spread documents evenly across hash buckets [3], [6], [7]. Common templates or frequently copied texts fall into the same buckets. Since a bucket with $k$ documents produces $\frac{k(k-1)}{2}$ pairs to check, even a moderate increase in bucket size causes a huge jump in comparison work. When standard OpenMP schedules (\texttt{static}, \texttt{dynamic}, or \texttt{guided}) assign whole buckets to threads, one thread can get stuck working on a giant bucket while other cores finish early and wait, or dynamic scheduling can add unnecessary overhead on tiny buckets.
+
+\tocsubsection{3.4 Project Objectives}
+The main goals of this project are to:
+\begin{enumerate}
+    \item Build a synthetic dataset generator that can create both balanced and skewed duplicate groups.
+    \item Implement a sequential baseline pipeline using SimHash fingerprinting, band-based candidate generation, and Hamming-distance verification.
+    \item Parallelize the pipeline in C++17 using OpenMP and test standard scheduling modes (\texttt{static}, \texttt{dynamic}, and \texttt{guided}).
+    \item Design and implement a \textbf{workload-aware adaptive scheduling method} that estimates the work in each bucket before execution and breaks very large buckets into smaller parallel tasks.
+    \item Measure execution time, speedup, parallel efficiency, and load balance across different dataset sizes, skew levels, and thread counts.
+\end{enumerate}
+
+\tocsection{4. Literature Survey / Existing Work}
+
+\subsection*{1. On the Resemblance and Containment of Documents}
+\begin{litquote}
+\textbf{Broder [1]} introduced the mathematical model for measuring document similarity and containment using MinHash and random sampling. This paper showed how similar documents can be found without comparing every pair of documents directly.
+\end{litquote}
+
+\subsection*{2. Similarity Estimation Techniques from Rounding Algorithms}
+\begin{litquote}
+\textbf{Charikar [2]} introduced locality-sensitive hashing based on random hyperplane rounding, known as \textbf{SimHash}. This work showed that the similarity between two high-dimensional feature vectors can be estimated from the Hamming distance between their compact binary fingerprints.
+\end{litquote}
+
+\subsection*{3. LSH Forest: Self-Tuning Indexes for Similarity Search}
+\begin{litquote}
+\textbf{Bawa, Condie, and Ganesan [3]} proposed the LSH Forest index to handle different similarity thresholds without manual tuning, and showed how uneven data distributions can slow down similarity searches.
+\end{litquote}
+
+\subsection*{4. Probabilistic Near-Duplicate Detection Using SimHash}
+\begin{litquote}
+\textbf{Sood and Loguinov [4]} analyzed how SimHash performs on large web datasets. They showed that while SimHash is very good at filtering out unrelated documents, generating and checking the remaining candidate pairs still takes significant compute time.
+\end{litquote}
+
+\subsection*{5. Near-Duplicate Detection in an Academic Digital Library}
+\begin{litquote}
+\textbf{Williams and Giles [5]} tested SimHash and shingle-based duplicate detection on the CiteSeerX digital library, comparing fingerprint size, filtering speed, and detection accuracy.
+\end{litquote}
+
+\subsection*{6. A Scalable Parallel Deduplication Algorithm}
+\begin{litquote}
+\textbf{Santos et al. [6]} built parallel deduplication algorithms on multicore CPUs and showed that uneven candidate cluster sizes cause threads to become unbalanced unless the workload is split carefully.
+\end{litquote}
+
+\subsection*{7. Efficient String Similarity Join in Multi-Core and Distributed Systems}
+\begin{litquote}
+\textbf{Yan et al. [7]} studied parallel string similarity joins on multicore and distributed systems, showing that splitting data based on item frequency helps avoid bottlenecks from skewed inputs.
+\end{litquote}
+
+\subsection*{8. Parallel Loop Scheduling for High Performance Computers}
+\begin{litquote}
+\textbf{Yue and Lilja [8]} compared static, dynamic, and guided loop scheduling in parallel computing and showed that no single fixed schedule works best for every type of workload.
+\end{litquote}
+
+\subsection*{9. Accelerating Content-Defined-Chunking-Based Data Deduplication by Exploiting Parallelism}
+\begin{litquote}
+\textbf{Xia et al. [9]} developed P-Dedupe, a parallel deduplication system that separates fingerprinting and verification into parallel stages with dynamic task assignment to keep multicore CPUs busy.
+\end{litquote}
+
+\subsection*{10. Parallel Near-Duplicate Document Detection Using General-Purpose GPU}
+\begin{litquote}
+\textbf{Peshevski, Zdraveski, and Ristov [10]} built a GPU-based MinHash pipeline for near-duplicate document detection, showing that fine-grained parallelism works well for fingerprint-based similarity search.
+\end{litquote}
+
+\subsection*{11. Automatic Near-Duplicate Content Document Detection in a Cancer Registry}
+\begin{litquote}
+\textbf{Niemi et al. [11]} used SimHash fingerprinting followed by sequence alignment to find near-duplicate medical reports in a cancer registry, showing that fast fingerprint filtering paired with exact verification works well on real text data.
+\end{litquote}
+
+\tocsection{5. Proposed Methodology with Novelty}
+
+The system will be implemented in C++17 using OpenMP for shared-memory parallelism.
+
+\begin{center}
+\fcolorbox{rulecolor}{codebg}{%
+\parbox{0.97\textwidth}{\centering\footnotesize\ttfamily
+Input Documents ──> SimHash Fingerprinting ──> Band Partitioning \& Candidate Generation ──> Skew-Aware Adaptive Parallel Verification (OpenMP) ──> Final Duplicate Pairs
+}}
+\end{center}
+
+\tocsubsection{5.1 Dataset Generation}
+A synthetic dataset generator will be built to create original documents, exact copies, slightly modified copies, and unrelated documents. The generator will support configurable document lengths and control how evenly or unevenly duplicates are grouped (balanced vs.\ skewed distributions). A fixed random seed will be used so all experiments can be repeated on the exact same data.
+
+\tocsubsection{5.2 Document Fingerprinting}
+Each document will be broken into small word groups (shingles) and hashed into a 64-bit SimHash fingerprint. Documents with similar wording will produce fingerprints that differ in only a few bit positions.
+
+\tocsubsection{5.3 Candidate Generation}
+To avoid checking all $O(N^2)$ document pairs, each 64-bit fingerprint will be split into fixed-size bands. Documents that have the same band value in the same band position will be placed into the same hash bucket and treated as candidate pairs. Since the same pair of documents can match in more than one band, duplicate candidate pairs will be removed before the final check.
+
+The candidate generation step will also be checked against a brute-force all-pairs comparison on small test datasets to make sure near-duplicate pairs are not missed.
+
+\tocsubsection{5.4 Similarity Verification}
+For each candidate pair, the system will calculate the Hamming distance between their two 64-bit fingerprints using a bitwise XOR operation and bit counting. Any pair whose Hamming distance is less than or equal to a threshold $k$ will be reported as a near-duplicate.
+
+\tocsubsection{5.5 Sequential Baseline}
+A single-threaded sequential version of the pipeline will be implemented first. It will be used both to check that the parallel results are correct and as the baseline time ($T_1$) for calculating speedup.
+
+\tocsubsection{5.6 Standard Parallel Implementation (OpenMP)}
+OpenMP will be used to run the pipeline across multiple CPU threads. Three built-in loop scheduling policies will be tested:
+\begin{itemize}
+    \item \textbf{Static Scheduling}: Divides loop iterations into fixed chunks ahead of time. It has very low overhead, but threads can become unbalanced if some buckets are much larger than others.
+    \item \textbf{Dynamic Scheduling}: Assigns chunks to threads as they become free. This helps balance uneven work, but adds synchronization overhead.
+    \item \textbf{Guided Scheduling}: Starts with larger chunks and gradually uses smaller chunks to balance overhead and load distribution.
+\end{itemize}
+
+All scheduling modes will run on the exact same input documents and candidate logic so that any runtime differences come only from how the parallel work is scheduled.
+
+\tocsubsection{5.7 Proposed Workload-Aware Adaptive Scheduling}
+For a bucket with $k$ documents, the number of pairs to process grows quadratically:
+$$\text{Cost}(k) = \frac{k(k - 1)}{2}$$
+
+When bucket sizes are skewed, a few very large buckets take up most of the execution time. The proposed adaptive approach will work in four steps:
+\begin{enumerate}
+    \item \textbf{Work Estimation}: Calculate the number of pairs $\frac{k(k-1)}{2}$ in each bucket before starting the parallel comparison phase.
+    \item \textbf{Bucket Classification}: Separate normal-sized buckets from oversized buckets based on the distribution of bucket work.
+    \item \textbf{Splitting Large Buckets}: Break oversized buckets into smaller sub-tasks of pairs instead of giving an entire huge bucket to a single thread.
+    \item \textbf{Parallel Execution}: Schedule the normal buckets and the split sub-tasks across OpenMP threads so all cores stay evenly loaded.
+\end{enumerate}
+
+This adaptive approach will be tested directly against the sequential baseline and the standard OpenMP schedules.
+
+\tocsubsection{5.8 Experimental Evaluation}
+The experiments will test different settings for:
+\begin{itemize}
+    \item \textbf{Dataset Size ($N$)}: Small to larger document collections.
+    \item \textbf{Workload Skew}: Balanced datasets vs.\ skewed datasets with heavy duplicate clusters.
+    \item \textbf{Thread Count}: 1, 2, 4, 8, and the maximum available CPU threads.
+    \item \textbf{Scheduling Policies}: Sequential, OpenMP Static, OpenMP Dynamic, OpenMP Guided, and Proposed Adaptive.
+    \item \textbf{Chunk Sizes}: Different chunk size settings for scheduling.
+\end{itemize}
+
+\subsubsection*{Performance Metrics:}
+\begin{itemize}
+    \item \textbf{Execution Time ($T_p$)}: Runtime measured across repeated runs.
+    \item \textbf{Speedup ($S_p$)}: $S_p = \frac{T_1}{T_p}$
+    \item \textbf{Parallel Efficiency ($E_p$)}: $E_p = \frac{S_p}{p}$
+    \item \textbf{Load Imbalance}: Ratio of maximum per-thread pair work to mean per-thread pair work.
+    \item \textbf{Candidate Buffer Storage}: Estimated memory required for raw and deduplicated candidate-pair buffers based on pair counts.
+    \item \textbf{Correctness \& Recall Checks}: Checking candidate-generation recall against brute-force all-pairs comparison on small test datasets and verifying exact output parity between the parallel and sequential pipelines.
+\end{itemize}
+
+\tocsubsection{5.9 Novelty in the Proposed Work}
+
+Prior studies in the literature survey cover document fingerprinting [1], [2], [4], [5], similarity indexing under data skew [3], [6], [7], and loop scheduling [8] mostly as separate problems. When parallelizing band-based candidate generation with standard OpenMP loop schedules, a straightforward bucket-level loop assigns each hash bucket as a single iteration, which can struggle when bucket sizes vary widely:
+
+\begin{enumerate}
+    \item \textbf{Using Known Bucket Cost Before Scheduling}: Standard OpenMP loop schedules do not inspect the $\frac{k(k-1)}{2}$ pair cost inside each bucket of size $k$. The proposed approach calculates this exact pair count ahead of time.
+    \item \textbf{Handling Heavy Skew on Multicore CPUs}: In near-duplicate detection, a few buckets can contain thousands of pairs while most buckets have very few. Splitting only the heavy buckets prevents a single slow thread from holding up the rest of the CPU cores.
+    \item \textbf{Combining Bucket Statistics with OpenMP Scheduling}: The scheduler will look at how uneven the bucket work is at runtime to decide how to schedule normal buckets while dynamically splitting heavy buckets.
+    \item \textbf{Testing When Adaptive Scheduling Helps Most}: Experiments will be run across both balanced and skewed datasets to see clearly when adaptive scheduling beats standard OpenMP policies and when simple static or guided scheduling is already enough.
+\end{enumerate}
+
+\tocsubsection{5.10 Deliverables \& Expected Outcomes}
+
+\begin{itemize}
+    \item \textbf{Course Deliverable}: A complete project report in \textbf{IEEE conference format} covering the design, implementation, hardware setup, speedup, efficiency, and load-balance results.
+    \item \textbf{Codebase}: A modular C++17 and OpenMP codebase with a synthetic dataset generator, SimHash fingerprinting, standard and adaptive parallel schedulers, and benchmark scripts.
+    \item \textbf{Expected Outcome}: Clear benchmark results showing how workload skew affects parallel near-duplicate detection and how much adaptive bucket splitting improves load balance and runtime.
+\end{itemize}
+
+\tocsection{6. References}
+
+\begin{itemize}[label={}, leftmargin=0pt, itemsep=0.45em]
+    \item \textbf{[1]} A. Z. Broder, ``On the resemblance and containment of documents,'' in \textit{Proc. Compression and Complexity of Sequences}, Positano, Italy, 1997, pp. 21--29, doi: \href{https://doi.org/10.1109/SEQUEN.1997.666900}{10.1109/SEQUEN.1997.666900}.
+    \item \textbf{[2]} M. S. Charikar, ``Similarity estimation techniques from rounding algorithms,'' in \textit{Proc. 34th Annu. ACM Symp. Theory of Computing (STOC)}, Montreal, QC, Canada, 2002, pp. 380--388, doi: \href{https://doi.org/10.1145/509907.509965}{10.1145/509907.509965}.
+    \item \textbf{[3]} M. Bawa, T. Condie, and P. Ganesan, ``LSH forest: Self-tuning indexes for similarity search,'' in \textit{Proc. 14th Int. Conf. World Wide Web (WWW)}, Chiba, Japan, 2005, pp. 651--660, doi: \href{https://doi.org/10.1145/1060745.1060840}{10.1145/1060745.1060840}.
+    \item \textbf{[4]} S. Sood and D. Loguinov, ``Probabilistic near-duplicate detection using simhash,'' in \textit{Proc. 20th ACM Int. Conf. Information and Knowledge Management (CIKM)}, Glasgow, UK, 2011, pp. 1117--1126, doi: \href{https://doi.org/10.1145/2063576.2063737}{10.1145/2063576.2063737}.
+    \item \textbf{[5]} K. Williams and C. L. Giles, ``Near duplicate detection in an academic digital library,'' in \textit{Proc. ACM Symp. Document Engineering (DocEng)}, Florence, Italy, 2013, pp. 91--94, doi: \href{https://doi.org/10.1145/2494266.2494312}{10.1145/2494266.2494312}.
+    \item \textbf{[6]} W. Santos, T. Teixeira, C. Machado, W. Meira Jr., A. S. da Silva, R. Ferreira, and D. Guedes, ``A Scalable Parallel Deduplication Algorithm,'' in \textit{Proc. 19th Int. Symp. Computer Architecture and High Performance Computing (SBAC-PAD)}, Gramado, Brazil, 2007, pp. 79--86, doi: \href{https://doi.org/10.1109/SBAC-PAD.2007.32}{10.1109/SBAC-PAD.2007.32}.
+    \item \textbf{[7]} C. Yan, X. Zhao, Q. Zhang, and Y. Huang, ``Efficient string similarity join in multi-core and distributed systems,'' \textit{PLoS ONE}, vol. 12, no. 3, Art. no. e0172526, Mar. 2017, doi: \href{https://doi.org/10.1371/journal.pone.0172526}{10.1371/journal.pone.0172526}.
+    \item \textbf{[8]} K. K. Yue and D. J. Lilja, ``Parallel loop scheduling for high performance computers,'' \textit{Advances in Parallel Computing}, Elsevier, vol. 10, pp. 243--264, 1995, doi: \href{https://doi.org/10.1016/S0927-5452(06)80016-X}{10.1016/S0927-5452(06)80016-X}.
+    \item \textbf{[9]} W. Xia, D. Feng, H. Jiang, Y. Zhang, V. Chang, and X. Zou, ``Accelerating content-defined-chunking based data deduplication by exploiting parallelism,'' \textit{Future Generation Computer Systems}, vol. 98, pp. 406--418, Sep. 2019, doi: \href{https://doi.org/10.1016/j.future.2019.02.008}{10.1016/j.future.2019.02.008}.
+    \item \textbf{[10]} D. Peshevski, V. Zdraveski, and S. Ristov, ``Parallel near-duplicate document detection using general-purpose GPU,'' \textit{Computing and Informatics}, vol. 43, no. 3, pp. 583--610, 2024, doi: \href{https://doi.org/10.31577/cai_2024_3_583}{10.31577/cai\_2024\_3\_583}.
+    \item \textbf{[11]} T. Niemi, J. P. Ghobril, G. Defossez, S. Germann, E. Martin, and J.-L. Bulliard, ``Automatic (near-) duplicate content document detection in a cancer registry,'' \textit{International Journal of Medical Informatics}, vol. 195, Art. no. 105799, Mar. 2025, doi: \href{https://doi.org/10.1016/j.ijmedinf.2025.105799}{10.1016/j.ijmedinf.2025.105799}.
+\end{itemize}
+
+\end{document}
